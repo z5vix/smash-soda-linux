@@ -264,10 +264,14 @@ static int dev_make_abs(void)
 {
 	int fd = open("/dev/uinput", O_RDWR | O_NONBLOCK);
 	if (fd < 0) return -1;
+	/* An absolute *pointer* (like a VM's USB tablet): ABS_X/ABS_Y plus mouse buttons and no BTN_TOUCH. With BTN_TOUCH /
+	 * INPUT_PROP_DIRECT the compositor classes it as a touchscreen and the cursor never moves. */
 	ioc(fd, UI_SET_EVBIT, EV_KEY);
 	ioc(fd, UI_SET_EVBIT, EV_ABS);
-	ioc(fd, UI_SET_KEYBIT, BTN_TOUCH);
-	ioc(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+	ioc(fd, UI_SET_KEYBIT, BTN_LEFT);
+	ioc(fd, UI_SET_KEYBIT, BTN_RIGHT);
+	ioc(fd, UI_SET_KEYBIT, BTN_MIDDLE);
+	ioc(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER);
 	abs_setup(fd, ABS_X, 0, 65535, 0, 0);
 	abs_setup(fd, ABS_Y, 0, 65535, 0, 0);
 	struct uinput_setup us;
@@ -279,6 +283,13 @@ static int dev_make_abs(void)
 }
 
 static int g_abs_x, g_abs_y;
+static void abs_flush(void)
+{
+	emit(g_mouse_abs, EV_ABS, ABS_X, g_abs_x);
+	emit(g_mouse_abs, EV_ABS, ABS_Y, g_abs_y);
+	sync_(g_mouse_abs);
+}
+
 static void input_drain(void)
 {
 	uint32_t head = g_in->head, tail = g_in->tail;
@@ -288,10 +299,14 @@ static void input_drain(void)
 		tail++;
 		switch (e.type) {
 		case SSB_EV_KEY:
-			if (g_kbd >= 0) { emit(g_kbd, EV_KEY, e.a, e.b ? 1 : 0); dirty_k = 1; }
-			break;
 		case SSB_EV_REL:
-			if (g_kbd >= 0) { emit(g_kbd, EV_REL, e.a, e.b); dirty_k = 1; }
+			/* A click right after a move must happen at the new position: deliver the move first. */
+			if (dirty_a) { abs_flush(); dirty_a = 0; }
+			if (g_kbd >= 0) {
+				if (e.type == SSB_EV_KEY) emit(g_kbd, EV_KEY, e.a, e.b ? 1 : 0);
+				else emit(g_kbd, EV_REL, e.a, e.b);
+				dirty_k = 1;
+			}
 			break;
 		case SSB_EV_ABS:
 			if (g_mouse_abs >= 0) {
@@ -302,12 +317,8 @@ static void input_drain(void)
 		}
 	}
 	g_in->tail = tail;
+	if (dirty_a) abs_flush();
 	if (dirty_k) sync_(g_kbd);
-	if (dirty_a) {
-		emit(g_mouse_abs, EV_ABS, ABS_X, g_abs_x);
-		emit(g_mouse_abs, EV_ABS, ABS_Y, g_abs_y);
-		sync_(g_mouse_abs);
-	}
 }
 
 /* -------------------------------------------------------------------- main */

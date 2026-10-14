@@ -120,6 +120,7 @@ python3 gen-include-shim.py "$BUILD/src" | tail -1
 cmake --build "$BUILD/cmake" -j"$(nproc)"
 
 step "Building the helpers"
+rm -f bridge/ssb-padd   # a running copy keeps its old file
 gcc -O2 -Wall -Wextra -o bridge/ssb-padd bridge/ssb-padd.c
 $CXX -std=gnu++20 -O2 -shared -static -w nvenc-proxy/nvenc_proxy.cpp -o "$BUILD/nvEncodeAPI64.dll" -ld3d11 -ldxgi -luuid
 $CXX -std=gnu++20 -O2 -static -w bridge/ipc_probe.cpp -o bridge/ipc_probe.exe
