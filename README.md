@@ -1,4 +1,13 @@
-# Smash Soda for Linux
+# smash-soda-linux
+Parsec Smash Soda for Linux systems. because ~~nobody else'd~~ port this, and i waited simply far too long. AI was used. what you got an issue with that? don't use the app. simple... 
+
+Tested on CachyOS. Built with Claude. 
+Wait you're telling me there's BEEN a smash soda fork for Linux systems already?!?! well... this exists now i guess.. this isn't just a simple build, it adds entirely new things to make it more native than the other existing fork that exists.
+Discord is 5vix if you want to tell me something. 
+if you want to give anyone anything, let it be MickeyUK. go buy him a coffee.
+
+---
+
 
 Host [Parsec](https://parsec.app) rooms from your **Linux desktop** with [Smash Soda](https://github.com/soda-arcade/SmashSoda).
 The Windows build runs under Proton (GE-Proton via `umu-launcher`); the Windows-only pieces are replaced by native Linux helpers,
@@ -87,5 +96,5 @@ Notes for hacking: encoder and pacing details live in `nvenc-proxy/nvenc_proxy.c
 regenerates the patch and overlay from a modified source tree.
 
 ## License
-This project's own files are MIT licensed, like Smash Soda. Smash Soda is (c) Flavio Freitas and Soda Arcade; Parsec and its SDK belong to Parsec Cloud / Unity.
-Not affiliated with either.
+This project's own files are licensed under the GNU GPL v3 (see `LICENSE`). Smash Soda itself is MIT licensed, (c) Flavio Freitas and Soda Arcade, and is
+downloaded from upstream at build time; Parsec and its SDK belong to Parsec Cloud / Unity. Not affiliated with either.
