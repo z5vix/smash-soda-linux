@@ -1,0 +1,1665 @@
+diff -ruN a/SmashSoda/AudioSource.cpp b/SmashSoda/AudioSource.cpp
+--- a/SmashSoda/AudioSource.cpp	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/AudioSource.cpp	2026-10-14 06:30:22.797165054 -0400
+@@ -1,4 +1,5 @@
+ ﻿#include "AudioSource.h"
++#include "AudioProcessLoopback.h"
+ #include "helpers/WStringConvert.h"
+ #include <algorithm>
+ #include <utility>
+@@ -201,6 +202,7 @@
+ 	else {
+ 		currentDevice.index = static_cast<size_t>(index);
+ 	}
++	m_excludedProcessId = 0;
+ 
+ 	releaseLocal();
+ 
+@@ -213,6 +215,134 @@
+ 	return false;
+ }
+ 
++/**
++* Re-activates this loopback source so it captures everything on the default output
++* device except the given process (and its child processes). Only meaningful for
++* render-flow (speaker loopback) sources; a no-op guard covers accidental use on mic input.
++* currentDevice is left untouched so a later call to setDevice(currentDevice.index) can
++* restore the user's actual chosen output device.
++*/
++bool AudioSource::setDeviceExcludingProcess(DWORD excludeProcessId)
++{
++	if (m_eDataFlow != eRender || excludeProcessId == 0) return false;
++
++	HRESULT hr;
++	REFERENCE_TIME hnsRequestedDuration = 1000000; // 100ms, matches setDevice()
++	UINT32 bufferFrameCount;
++
++	IAudioClient* pAudioClient = nullptr;
++	DWORD streamFlagsEnhanced = 0;
++	size_t targetFramesPerChunk = 0;
++	size_t targetBufferSize = 0;
++
++	// Process-loopback capture has no negotiable mix format to query, so we request a
++	// plain float stereo stream ourselves instead of calling GetMixFormat().
++	WAVEFORMATEX wfx = {};
++	wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
++	wfx.nChannels = 2;
++	wfx.nSamplesPerSec = 48000;
++	wfx.wBitsPerSample = 32;
++	wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample) / 8;
++	wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
++	WAVEFORMATEX* pwfx = &wfx;
++
++	auto releaseLocal = [&]()
++	{
++		SAFE_RELEASE(pAudioClient);
++	};
++
++	auto releaseAll = [&]() {
++		releaseLocal();
++		SAFE_RELEASE(m_pCaptureClient);
++	};
++
++
++	m_mutex.lock();
++
++	m_buffers[0].clear();
++	m_buffers[1].clear();
++	m_readyBuffers.clear();
++	m_isReady = false;
++	m_previewIndex = 0;
++
++	releaseAll();
++
++	CoInitializeEx(NULL, COINIT_MULTITHREADED);
++
++	hr = AudioProcessLoopback::ActivateExcludeProcessClient(excludeProcessId, &pAudioClient);
++	FAIL_EXIT(hr);
++
++	setFrequency((uint32_t)pwfx->nSamplesPerSec);
++
++	m_sourceChannels = pwfx->nChannels;
++	m_outputChannels = AUDIOSRC_TARGET_CHANNELS;
++	m_sampleFormat = SampleFormat::Float32;
++	m_bytesPerSample = 4;
++
++	streamFlagsEnhanced =
++		m_streamFlags |
++		AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
++		AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
++
++	hr = pAudioClient->Initialize(
++		AUDCLNT_SHAREMODE_SHARED,
++		streamFlagsEnhanced,
++		hnsRequestedDuration,
++		0,
++		pwfx,
++		NULL);
++
++	if (FAILED(hr)) {
++		hr = pAudioClient->Initialize(
++			AUDCLNT_SHAREMODE_SHARED,
++			m_streamFlags,
++			hnsRequestedDuration,
++			0,
++			pwfx,
++			NULL);
++	}
++
++	FAIL_EXIT(hr);
++
++	hr = pAudioClient->GetBufferSize(&bufferFrameCount);
++	FAIL_EXIT(hr);
++
++	hr = pAudioClient->GetService(IID_IAudioCaptureClient, (void**)&m_pCaptureClient);
++	FAIL_EXIT(hr);
++
++	hr = pAudioClient->Start();
++	FAIL_EXIT(hr);
++
++	targetFramesPerChunk = static_cast<size_t>(pwfx->nSamplesPerSec / 100);
++	targetFramesPerChunk = (std::max)(targetFramesPerChunk, static_cast<size_t>(bufferFrameCount / 4));
++	if (targetFramesPerChunk < 80) {
++		targetFramesPerChunk = 80;
++	}
++	targetFramesPerChunk = (std::min)(targetFramesPerChunk, static_cast<size_t>(pwfx->nSamplesPerSec / 5));
++
++	targetBufferSize = targetFramesPerChunk * m_outputChannels;
++	m_maxBufferSize = targetBufferSize;
++	m_buffers[0].reserve(m_maxBufferSize + m_outputChannels * 2);
++	m_buffers[1].reserve(m_maxBufferSize + m_outputChannels * 2);
++
++	m_excludedProcessId = excludeProcessId;
++
++	releaseLocal();
++
++	m_mutex.unlock();
++	return true;
++
++EXIT:
++	releaseAll();
++	m_mutex.unlock();
++	return false;
++}
++
++DWORD AudioSource::getExcludedProcessId() const
++{
++	return m_excludedProcessId;
++}
++
+ const std::vector<AudioSourceDevice> AudioSource::getDevices()
+ {
+ 	return m_devices;
+diff -ruN a/SmashSoda/AudioSource.h b/SmashSoda/AudioSource.h
+--- a/SmashSoda/AudioSource.h	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/AudioSource.h	2026-10-14 06:30:22.797349886 -0400
+@@ -48,7 +48,12 @@
+ class AudioSource
+ {
+ public:
++	// Linux bridge: the audio pump feeds the level meter, since desktop audio no longer passes through this class.
++	void setPreviewSample(int16_t sample) { m_lastPreviewSample.store(sample, std::memory_order_relaxed); }
++
+ 	bool setDevice(int index = 0);
++	bool setDeviceExcludingProcess(DWORD excludeProcessId);
++	DWORD getExcludedProcessId() const;
+ 	void fetchDevices();
+ 	virtual void setFrequency(uint32_t frequency);
+ 	const uint32_t getFrequency() const;
+@@ -108,5 +113,7 @@
+ 
+ 	uint32_t m_frequency = 48000;  // Default to 48kHz (Parsec's preferred rate)
+ 
++	DWORD m_excludedProcessId = 0;
++
+ 	mutex m_mutex;
+ };
+diff -ruN a/SmashSoda/core/Config.cpp b/SmashSoda/core/Config.cpp
+--- a/SmashSoda/core/Config.cpp	2026-10-14 06:21:28.092028713 -0400
++++ b/SmashSoda/core/Config.cpp	2026-10-14 06:30:22.802347301 -0400
+@@ -102,6 +102,7 @@
+ 			cfg.audio.speakersVolume = setValue(cfg.audio.speakersVolume, j["Audio"]["speakersVolume"].get<float>());
+ 			cfg.audio.speakersEnabled = setValue(cfg.audio.speakersEnabled, j["Audio"]["speakersEnabled"].get<bool>());
+ 			cfg.audio.sfxEnabled = setValue(cfg.audio.sfxEnabled, j["Audio"]["sfxEnabled"].get<bool>());
++			cfg.audio.excludedAppExe = setValue(cfg.audio.excludedAppExe, j["Audio"]["excludedAppExe"].get<string>());
+ 
+ 			// Set Video properties
+ 			cfg.video.monitor = setValue(cfg.video.monitor, j["Video"]["monitor"].get<unsigned int>());
+@@ -113,6 +114,9 @@
+ 			cfg.video.resolutionIndex = setValue(cfg.video.resolutionIndex, j["Video"]["resolutionIndex"].get<unsigned int>());
+ 			cfg.video.lanczos = setValue(cfg.video.lanczos, j["Video"]["lanczos"].get<bool>());
+ 			cfg.video.framePacing = setValue(cfg.video.framePacing, j["Video"].value("framePacing", true));
++			cfg.video.linuxCapture = setValue(cfg.video.linuxCapture, j["Video"].value("linuxCapture", 0u));
++			cfg.video.linuxSource = setValue(cfg.video.linuxSource, j["Video"].value("linuxSource", 1u));
++			cfg.video.rememberScreen = setValue(cfg.video.rememberScreen, j["Video"].value("rememberScreen", false));
+ 			cfg.video.captureMethod = setValue(cfg.video.captureMethod, j["Video"]["captureMethod"].get<unsigned int>());
+ 			cfg.video.fps = setValue(cfg.video.fps, j["Video"]["fps"].get<unsigned int>());
+ 			cfg.video.bandwidth = setValue(cfg.video.bandwidth, j["Video"]["bandwidth"].get<unsigned int>());
+@@ -356,7 +360,8 @@
+ 		{"speakersFrequency", cfg.audio.speakersFrequency},
+ 		{"speakersVolume", cfg.audio.speakersVolume},
+ 		{"speakersEnabled", cfg.audio.speakersEnabled},
+-		{"sfxEnabled", cfg.audio.sfxEnabled}
++		{"sfxEnabled", cfg.audio.sfxEnabled},
++		{"excludedAppExe", cfg.audio.excludedAppExe}
+ 	};
+ 
+ 	// Video
+@@ -370,6 +375,9 @@
+ 		{"resolutionIndex", cfg.video.resolutionIndex},
+ 		{"lanczos", cfg.video.lanczos},
+ 		{"framePacing", cfg.video.framePacing},
++		{"linuxCapture", cfg.video.linuxCapture},
++		{"linuxSource", cfg.video.linuxSource},
++		{"rememberScreen", cfg.video.rememberScreen},
+ 		{"captureMethod", cfg.video.captureMethod},
+ 		{"fps", cfg.video.fps},
+ 		{"bandwidth", cfg.video.bandwidth}
+diff -ruN a/SmashSoda/core/Config.h b/SmashSoda/core/Config.h
+--- a/SmashSoda/core/Config.h	2026-10-14 06:21:28.092028713 -0400
++++ b/SmashSoda/core/Config.h	2026-10-14 06:30:22.802538666 -0400
+@@ -49,6 +49,7 @@
+ 		float speakersVolume = 50;
+ 		bool speakersEnabled = true;
+ 		bool sfxEnabled = true;
++		string excludedAppExe = "";	// Executable to keep out of guests' shared audio (e.g. "Discord.exe"). Empty = none.
+ 	};
+ 
+ 	class Video {
+@@ -62,6 +63,9 @@
+ 		unsigned int resolutionIndex = 0;
+ 		bool lanczos = true;
+ 		bool framePacing = true;
++		unsigned int linuxCapture = 0;    // Linux build: 0 automatic, 1 GPU zero-copy, 2 GPU download, 3 compatibility
++		unsigned int linuxSource = 1;     // Linux build: 1 screen, 2 window, 3 either
++		bool rememberScreen = false;      // Linux build: remember the screen-share choice   // Linux build: stream up to the shared display's refresh rate
+ 		unsigned int captureMethod = 0;
+ 		unsigned int fps = 60;
+ 		unsigned int bandwidth = 20;
+diff -ruN a/SmashSoda/DX11.cpp b/SmashSoda/DX11.cpp
+--- a/SmashSoda/DX11.cpp	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/DX11.cpp	2026-10-14 06:30:22.797755975 -0400
+@@ -1,4 +1,5 @@
+ #include "DX11.h"
++#include "linux/SsbBridge.h"
+ #include <d3dcompiler.h>
+ 
+ #pragma comment(lib, "d3dcompiler.lib")
+@@ -85,6 +86,8 @@
+ {
+ 	SAFE_RELEASE(_deskDupl);
+ 	SAFE_RELEASE(_lAcquiredDesktopImage);
++	SAFE_RELEASE(_bridgeTexture);
++	_bridgeW = _bridgeH = 0;
+ 	releaseScaledRenderTarget();
+ 	releaseLastSubmittedTexture();
+ }
+@@ -311,6 +314,15 @@
+ 
+ bool DX11::captureScreen(ParsecDSO* ps)
+ {
++	// Running under Proton with the Linux capture helper: use the real Linux screen.
++	_bridgePaced = bridgeAlive();
++	if (_bridgePaced)
++		return captureScreenBridge(ps);
++	if (SsbBridge::linuxMode()) {   // helper is between shares (e.g. the picker is open): keep the last frame, don't touch DXGI
++		Sleep(10);
++		return false;
++	}
++
+ 	bool useWGC = (_captureMethod == CaptureMethod::GraphicsCapture) ||
+ 	              (_captureMethod == CaptureMethod::Auto && WGCapture::isSupported());
+ 
+@@ -373,6 +385,223 @@
+ 	return true;
+ }
+ 
++bool DX11::bridgeAlive()
++{
++	ssb_video* v = SsbBridge::video();
++	if (!v) return false;
++	const DWORD now = GetTickCount();
++	const uint32_t hb = v->heartbeat;
++	if (hb != _bridgeHb || _bridgeHbTick == 0) {
++		_bridgeHb = hb;
++		_bridgeHbTick = now;
++		return true;
++	}
++	return (now - _bridgeHbTick) < 2000;
++}
++
++bool DX11::captureScreenBridge(ParsecDSO* ps)
++{
++	ssb_video* v = SsbBridge::video();
++	if (!v || !_device || !_context) return false;
++
++	// Wait for the next frame: the media loop is paced by the screen, one submit per new frame. After
++	// 40 ms without one (static desktop) the last frame is submitted again as a keep-alive.
++	int defaultHz = (int)Config::cfg.video.fps; if (defaultHz < 10 || defaultHz > 240) defaultHz = 60;
++	const int paceHz = SsbBridge::tuningInt("submit_pace_hz", defaultHz);   // steady-clock submission; 0 = per arrival
++	if (paceHz > 0) {
++		LARGE_INTEGER qf, qn; QueryPerformanceFrequency(&qf);
++		static double next = 0;
++		auto nowMs = [&]() { QueryPerformanceCounter(&qn); return qn.QuadPart * 1000.0 / qf.QuadPart; };
++		const double interval = 1000.0 / paceHz;
++		double now = nowMs();
++		if (next == 0 || next < now - 100) next = now;
++		next += interval;
++		// High-resolution waitable timer: sleeps precisely without busy-spinning (matters at 200+ Hz).
++		static HANDLE hrTimer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*CREATE_WAITABLE_TIMER_HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
++		for (double rem = next - nowMs(); rem > 0; rem = next - nowMs()) {
++			if (hrTimer) {
++				LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(rem * 10000.0);   // relative, 100 ns units
++				SetWaitableTimer(hrTimer, &due, 0, nullptr, nullptr, FALSE);
++				WaitForSingleObject(hrTimer, 50);
++			}
++			else {
++				Sleep(rem > 2.0 ? (DWORD)(rem - 1.0) : 0);
++			}
++		}
++	} else {
++		const int submitHz = SsbBridge::tuningInt("submit_hz", 0);      // 0 = follow the screen, keep-alive after 40 ms
++		const DWORD maxWait = submitHz > 0 ? (DWORD)(1000 / submitHz > 0 ? 1000 / submitHz : 1) : 40;
++		const DWORD t0 = GetTickCount();
++		while (v->latest == _bridgeSeq && (GetTickCount() - t0) < maxWait)
++			Sleep(1);
++	}
++
++	LARGE_INTEGER workStart; QueryPerformanceCounter(&workStart);
++	// FPS is a cap, not a rate: with a steady clock above the content's own frame rate the tick must not
++	// resubmit identical frames (that would only burn encoder time). Repeat the last frame only as a keep-alive.
++	if (paceHz > 0 && v->latest == _bridgeSeq && _bridgeTexture) {
++		static double lastSubmitMs2 = 0;
++		LARGE_INTEGER qf2, qn2; QueryPerformanceFrequency(&qf2); QueryPerformanceCounter(&qn2);
++		const double nowMs2 = qn2.QuadPart * 1000.0 / qf2.QuadPart;
++		if (_bridgeLastSubmitMs > 0 && nowMs2 - _bridgeLastSubmitMs < 100.0) return true;   // nothing new: stay quiet
++	}
++
++	_mutex.lock();
++
++	const uint32_t latest = v->latest;
++	bool newFrameThisCall = false;
++	if (latest != _bridgeSeq) {
++		_bridgeStatNew += (latest > _bridgeSeq ? latest - _bridgeSeq : 1);
++		if (_bridgeSeq != 0 && latest > _bridgeSeq + 1) {
++			_bridgeStatSkipped += latest - _bridgeSeq - 1;   // source produced frames we never picked up
++			static int skipLogs = 0;
++			if (latest - _bridgeSeq > 3 && skipLogs++ < 10) SsbBridge::log("STALL: capture loop skipped %u source frames", latest - _bridgeSeq - 1);
++		}
++	} else _bridgeStatDup++;
++	{
++		const DWORD now = GetTickCount();
++		if (_bridgeStatTick == 0) _bridgeStatTick = now;
++		if (now - _bridgeStatTick >= 5000) {
++			SsbBridge::log("video: submit spacing ms [<8 | 8-14 | 14-16 | 16-17.5 | 17.5-20 | 20-30 | 30-50 | >50] = [%u | %u | %u | %u | %u | %u | %u | %u]",
++				_bridgeHist[0], _bridgeHist[1], _bridgeHist[2], _bridgeHist[3], _bridgeHist[4], _bridgeHist[5], _bridgeHist[6], _bridgeHist[7]);
++			memset(_bridgeHist, 0, sizeof _bridgeHist);
++			SsbBridge::log("video: %.1f new frames/s, %.1f repeated/s, %llu source frames skipped (source fps %u), slowest submit %.1f ms",
++				_bridgeStatNew * 1000.0 / (now - _bridgeStatTick), _bridgeStatDup * 1000.0 / (now - _bridgeStatTick),
++				(unsigned long long)_bridgeStatSkipped, (unsigned)v->fps, _bridgeSlowest);
++			_bridgeStatNew = _bridgeStatDup = _bridgeStatSkipped = 0; _bridgeStatTick = now; _bridgeSlowest = 0;
++		}
++	}
++	if (latest < _bridgeSeq) _bridgeSeq = 0; // helper restarted a session: frame numbering started over
++	if (latest != 0 && latest != _bridgeSeq)
++	{
++		if (_bridgeSeq == 0)
++			SsbBridge::log("video: first frame from the Linux screen (%ux%u)", (unsigned)v->info[latest % SSB_VIDEO_SLOTS].width, (unsigned)v->info[latest % SSB_VIDEO_SLOTS].height);
++		const uint32_t slot = latest % SSB_VIDEO_SLOTS;
++		const UINT w = v->info[slot].width, h = v->info[slot].height;
++		if (w == 0 || h == 0 || w > SSB_VIDEO_MAX_W || h > SSB_VIDEO_MAX_H)
++		{
++			_mutex.unlock();
++			return false;
++		}
++
++		if (!_bridgeTexture || _bridgeW != w || _bridgeH != h)
++		{
++			SAFE_RELEASE(_bridgeTexture);
++			D3D11_TEXTURE2D_DESC td = {};
++			td.Width = w; td.Height = h;
++			td.MipLevels = 1; td.ArraySize = 1;
++			td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++			td.SampleDesc.Count = 1;
++			td.Usage = D3D11_USAGE_DEFAULT;
++			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++			if (FAILED(_device->CreateTexture2D(&td, nullptr, &_bridgeTexture)))
++			{
++				_mutex.unlock();
++				return false;
++			}
++			_bridgeW = w; _bridgeH = h;
++			_bridgeTextureValid = false;
++		}
++
++		const ssb_gpu* gpu = reinterpret_cast<const ssb_gpu*>(reinterpret_cast<const uint8_t*>(v) + SSB_GPU_OFFSET);
++		if (gpu->enabled) {
++			// GPU mode: the frame lives in CUDA memory shared by the Linux helper and goes straight to the encoder.
++			// There are no pixels here to upload - the texture only has to exist so Parsec has something to submit.
++			_bridgePixels = nullptr;
++			_bridgeTextureValid = true;
++		}
++		else {
++		const uint8_t* pixels = reinterpret_cast<const uint8_t*>(v) + SSB_VIDEO_HDR_BYTES + (uint64_t)slot * SSB_VIDEO_SLOT_BYTES;
++		// Once the NVENC layer encodes straight from its own pre-uploaded copy, the texture's contents are no
++		// longer read, so skip the 11 MB CPU->GPU upload except for an occasional refresh (and whenever the
++		// fast path is not healthy, so a fallback never encodes a stale frame).
++		static unsigned uploadCounter = 0;
++		const bool skipUpload = _fastPathActive && _bridgeTextureValid && (++uploadCounter % 30) != 0;
++		if (!skipUpload) {
++			_context->UpdateSubresource(_bridgeTexture, 0, nullptr, pixels, w * 4, 0);
++			_bridgeTextureValid = true;
++		}
++		_bridgePixels = pixels;
++		}
++		newFrameThisCall = true;
++		_bridgeSeq = latest;
++
++		_desc.Width = w;
++		_desc.Height = h;
++		_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++	}
++
++	ID3D11Texture2D* frameToSubmit = _bridgeTexture;
++	if (!frameToSubmit)
++	{
++		_mutex.unlock();
++		return false;
++	}
++
++	// No new frame: the previous one is still in _bridgeTexture and is resubmitted to keep pacing.
++	if (isScalingEnabled())
++	{
++		ID3D11Texture2D* scaled = scaleTexture(_bridgeTexture);
++		if (scaled) frameToSubmit = scaled;
++	}
++
++	D3D11_TEXTURE2D_DESC submitDesc;
++	frameToSubmit->GetDesc(&submitDesc);
++	{
++		// Hooks into our nvEncodeAPI64.dll (looked up by full path - Proton's own library has the same file name).
++		typedef void (WINAPI *PFN_Note)();
++		typedef void (WINAPI *PFN_Offer)(const void*, uint32_t, uint32_t, void*);
++		static PFN_Note note = nullptr; static PFN_Offer offer = nullptr; static bool looked = false;
++		typedef int (WINAPI *PFN_Active)();
++		static PFN_Active active = nullptr;
++		if (!looked) {
++			char path[MAX_PATH]; GetModuleFileNameA(nullptr, path, MAX_PATH);
++			char* slash = strrchr(path, '\\'); if (slash) *slash = 0;
++			HMODULE m = GetModuleHandleA((std::string(path) + "\\nvEncodeAPI64.dll").c_str());
++			if (m) {
++				note = (PFN_Note)GetProcAddress(m, "SsbNoteSubmit");
++				offer = (PFN_Offer)GetProcAddress(m, "SsbOfferFrame");
++				active = (PFN_Active)GetProcAddress(m, "SsbFastPathActive");
++				looked = true;
++				SsbBridge::log("video: NVENC layer found (frame pre-upload %s)", offer ? "available" : "missing");
++			}
++		}
++		if (note) note();
++		_fastPathActive = active && active() != 0;
++		{
++			LARGE_INTEGER qf, qn; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&qn);
++			const double ms = qn.QuadPart * 1000.0 / qf.QuadPart;
++			static double lastSubmitMs = 0;
++			if (lastSubmitMs > 0) {
++				const double d = ms - lastSubmitMs;
++				static const double edges[7] = { 8, 14, 16, 17.5, 20, 30, 50 };
++				int b = 7; for (int i = 0; i < 7; i++) if (d < edges[i]) { b = i; break; }
++				_bridgeHist[b]++;
++			}
++			lastSubmitMs = ms;
++			_bridgeLastSubmitMs = ms;
++		}
++		// New, unscaled frame: let the encoder have it in CUDA memory before Parsec asks for it.
++		if (offer && newFrameThisCall && frameToSubmit == _bridgeTexture && _bridgePixels)
++			offer(_bridgePixels, _bridgeW, _bridgeH, frameToSubmit);
++	}
++	ParsecStatus submitStatus = ParsecHostD3D11SubmitFrame(ps, 0, _device, _context, frameToSubmit);
++	{
++		LARGE_INTEGER workEnd, qf; QueryPerformanceCounter(&workEnd); QueryPerformanceFrequency(&qf);
++		const double ms = (workEnd.QuadPart - workStart.QuadPart) * 1000.0 / qf.QuadPart;
++		if (ms > _bridgeSlowest) _bridgeSlowest = ms;
++		static int slowLogs = 0;
++		if (ms > 25 && slowLogs++ < 10) SsbBridge::log("STALL: frame upload+submit took %.0f ms", ms);
++	}
++	static int submitLogs = 0;
++	if (submitLogs < 3) { submitLogs++; SsbBridge::log("video: ParsecHostD3D11SubmitFrame returned %d", (int)submitStatus); }
++	if (ensureLastSubmittedTexture(submitDesc.Width, submitDesc.Height, submitDesc.Format))
++		_context->CopyResource(_lastSubmittedTexture, frameToSubmit);
++
++	_mutex.unlock();
++	return true;
++}
++
+ bool DX11::captureScreenDupl(ParsecDSO* ps)
+ {
+ 	if (!_deskDupl)
+@@ -840,6 +1069,7 @@
+ 
+ bool DX11::isScalingEnabled()
+ {
++	if (SsbBridge::linuxMode()) return false;   // the Linux helper scales (and the frame texture is a stand-in)
+ 	return _lanczosEnabled && _scalingInitialized && _targetWidth > 0 && _targetHeight > 0 && 
+ 	       (_targetWidth != (int)_desc.Width || _targetHeight != (int)_desc.Height);
+ }
+diff -ruN a/SmashSoda/DX11.h b/SmashSoda/DX11.h
+--- a/SmashSoda/DX11.h	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/DX11.h	2026-10-14 06:30:22.797911796 -0400
+@@ -5,7 +5,6 @@
+ #include <dxgi1_2.h>
+ #include <iostream>
+ //#include <atlbase.h>
+-#include <atlcomcli.h>
+ #include "parsec-dso.h"
+ #include <vector>
+ #include <string>
+@@ -79,6 +78,13 @@
+ 	HMONITOR getMonitorHandle();
+ 	bool captureScreenWGC(ParsecDSO* ps);
+ 	bool captureScreenDupl(ParsecDSO* ps);
++	bool captureScreenBridge(ParsecDSO* ps);
++	bool bridgeAlive();
++public:
++	// True while frames come from the Linux bridge: capture already waits for each new frame, so the
++	// media loop must not add its own pacing sleep (two unsynchronised 60 Hz clocks cause judder).
++	bool isBridgePaced() const { return _bridgePaced; }
++private:
+ 
+ 	mutex _mutex;
+ 
+@@ -121,6 +127,22 @@
+ 	UINT _lastSubmittedHeight = 0;
+ 	DXGI_FORMAT _lastSubmittedFormat = DXGI_FORMAT_UNKNOWN;
+ 
++	// Linux bridge capture (frames published by ssb-capture, see linux/SsbBridge.h)
++	ID3D11Texture2D* _bridgeTexture = nullptr;
++	UINT _bridgeW = 0, _bridgeH = 0;
++	bool _bridgePaced = false;
++	double _bridgeLastSubmitMs = 0;
++	bool _fastPathActive = false;      // NVENC layer encodes from its own copy; texture uploads can be skipped
++	bool _bridgeTextureValid = false;  // texture has been filled at least once
++	uint32_t _bridgeHist[8] = {};
++	const uint8_t* _bridgePixels = nullptr;
++	uint64_t _bridgeStatNew = 0, _bridgeStatDup = 0, _bridgeStatSkipped = 0;
++	double _bridgeSlowest = 0;
++	DWORD _bridgeStatTick = 0;
++	uint32_t _bridgeSeq = 0;
++	uint32_t _bridgeHb = 0;
++	DWORD _bridgeHbTick = 0;
++
+ 	// Windows Graphics Capture
+ 	CaptureMethod _captureMethod = CaptureMethod::Auto;
+ 	WGCapture _wgCapture;
+diff -ruN a/SmashSoda/helpers/PathHelper.cpp b/SmashSoda/helpers/PathHelper.cpp
+--- a/SmashSoda/helpers/PathHelper.cpp	2026-10-14 06:21:28.142797143 -0400
++++ b/SmashSoda/helpers/PathHelper.cpp	2026-10-14 06:30:22.877287117 -0400
+@@ -64,6 +64,7 @@
+ 
+ 		return dirPath;
+ 	}
++	return "";
+ }
+ 
+ std::string PathHelper::ConvertTCHARToString(const TCHAR* tcharStr) {
+diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
+--- a/SmashSoda/Hosting.cpp	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/Hosting.cpp	2026-10-14 06:30:22.798612518 -0400
+@@ -1,4 +1,7 @@
+ #include "Hosting.h"
++#include "linux/SsbAudio.h"
++#include "linux/SsbBridge.h"
++#include "AudioProcessLoopback.h"
+ #include "services/OverlayService.h"
+ #include "services/InputControlService.h"
+ #include "services/GuestStateStore.h"
+@@ -139,6 +142,10 @@
+ void Hosting::init() {
+ 	
+ 	_parsecStatus = ParsecInit(NULL, NULL, (char *)SDK_PATH, &_parsec);
++	if (SsbBridge::linuxMode()) {
++		Config::cfg.overlay.enabled = false;                 // the overlay is a Windows-only helper app
++		if (Config::cfg.video.fps > 60) Config::cfg.video.fps = 60;   // Parsec's host never sends more than 60 fps
++	}
+ 	_dx11.init();
+ 	GuestStateStore::instance().load();
+ 	
+@@ -174,6 +181,12 @@
+ 	audioIn.setDevice(Config::cfg.audio.inputDevice);
+ 	audioIn.captureAudio();
+ 	audioIn.volume = Config::cfg.audio.micVolume;
++
++	// Best-effort: if the configured app (e.g. Discord) is already running, keep its
++	// own audio out of the stream from the start. If it isn't running yet, pollSmashSoda()
++	// will pick it up once it launches.
++	refreshAudioExclusion();
++
+ 	_parsecSession.loadSessionCache();
+ 
+ 	fetchAccountData();
+@@ -207,6 +220,20 @@
+  */
+ void Hosting::LogCallback(ParsecLogLevel level, const char *msg, void *opaque) {
+ 	Hosting* self = static_cast<Hosting*>(opaque);
++
++	// Linux bridge diagnostics: everything Parsec says goes to parsec.log (IPs masked).
++	SsbBridge::logFile("parsec.log", msg);
++	{
++		std::string lower(msg);
++		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
++		if (lower.find("encod") != std::string::npos || lower.find("nvenc") != std::string::npos ||
++			lower.find("gpu") != std::string::npos || lower.find("hardware") != std::string::npos ||
++			lower.find("fail") != std::string::npos || lower.find("error") != std::string::npos ||
++			lower.find("codec") != std::string::npos) {
++			SsbBridge::log("parsec: %.300s", msg);
++		}
++	}
++
+ 	if (Config::cfg.general.parsecLogs) {
+ 		self->logMessage(msg);
+ 	}
+@@ -457,7 +484,11 @@
+ 			return guest;
+ 		}
+ 	}
+-	
++
++	// Not found: callers expect a reference, so hand back an empty placeholder (MSVC left this undefined).
++	static Guest missingGuest;
++	missingGuest = Guest();
++	return missingGuest;
+ }
+ 
+ /**
+@@ -626,6 +657,7 @@
+ 	_hostConfig.video->encoderMaxBitrate = bandwidth;
+ 	Config::cfg.video.fps = fps;
+ 	Config::cfg.video.bandwidth = bandwidth;
++	SsbBridge::setBitrateBudget(bandwidth * 1000);   // Linux build: the encoder layer enforces it as the room's total
+ }
+ 
+ /**
+@@ -720,6 +752,7 @@
+ 	}
+ 
+ 	_isRunning = false;
++	SsbBridge::setCaptureWanted(false);
+ 	GuestList::instance.clear();
+ 
+ 	// Stop hotseat mode
+@@ -899,6 +932,7 @@
+ 	const uint32_t SAFE_FREQUENCY = 48000;
+ 	const size_t SUBMIT_CHUNK_FRAMES = static_cast<size_t>(SAFE_FREQUENCY / 100); // 10ms
+ 	const size_t SUBMIT_CHUNK_SAMPLES = SUBMIT_CHUNK_FRAMES * 2; // stereo interleaved
++	constexpr size_t SUBMIT_CHUNK_SAMPLES_MAX = 960;                // 10 ms of 48 kHz stereo
+ 	const size_t MAX_PENDING_SAMPLES = SUBMIT_CHUNK_SAMPLES * 24; // ~240ms queue headroom
+ 
+ 	std::deque<int16_t> pendingIn;
+@@ -957,6 +991,63 @@
+ 		}
+ 	};
+ 
++	// Linux bridge audio: pumped on its own thread at a steady 10 ms cadence. The capture side delivers
++	// ~43 ms blocks; forwarding them as they arrive would hand Parsec bursts followed by silence, which
++	// sounds crackly, so chunks are released one per 10 ms from a small cushion instead. It never submits
++	// zero-padding: after an underrun it waits to refill, and it sheds a chunk if clock drift builds a backlog.
++	std::atomic<bool> bridgeAudioStop{ false };
++	std::thread bridgeAudioThread([&]() {
++		using clk = std::chrono::steady_clock;
++		std::vector<int16_t> buf;
++		size_t head = 0;
++		bool primed = false;
++		clk::time_point next = clk::now();
++		clk::time_point statTick = clk::now();
++		unsigned sent = 0, underruns = 0, shed = 0; double maxLateMs = 0;
++		const size_t chunk = SUBMIT_CHUNK_SAMPLES; // 10 ms stereo
++		const auto period = std::chrono::milliseconds(10);
++		while (!bridgeAudioStop.load()) {
++			if (audioOut.isEnabled && SsbAudio::active()) {
++				SsbAudio::read(buf);
++				if (!primed && buf.size() - head >= chunk * 5) { primed = true; next = clk::now(); } // ~50 ms cushion
++				if (primed) {
++					while (clk::now() >= next) {
++						const size_t avail = buf.size() - head;
++						if (avail < chunk) { primed = false; underruns++; break; }   // underrun: refill before resuming
++						if (avail > chunk * 12) { head += chunk; shed++; }           // >120 ms backlog: shed 10 ms (clock drift)
++						{ const double late = std::chrono::duration<double, std::milli>(clk::now() - next).count(); if (late > maxLateMs) maxLateMs = late; }
++						sent++;
++						{
++							// speaker volume + level meter (the desktop audio no longer passes through AudioSource)
++							static thread_local int16_t scaled[SUBMIT_CHUNK_SAMPLES_MAX];
++							const float vol = audioOut.volume;
++							int peak = 0;
++							const int16_t* src = buf.data() + head;
++							for (size_t i = 0; i < chunk; i++) {
++								int v = static_cast<int>(src[i] * vol);
++								scaled[i] = static_cast<int16_t>(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
++								const int a = v < 0 ? -v : v; if (a > peak) peak = a;
++							}
++							audioOut.setPreviewSample(static_cast<int16_t>(peak > 32767 ? 32767 : peak));
++							ParsecHostSubmitAudio(_parsec, PCM_FORMAT_INT16, SAFE_FREQUENCY, scaled, static_cast<uint32_t>(chunk / 2));
++						}
++						head += chunk;
++						next += period;
++					}
++				}
++				if (head > 48000) { buf.erase(buf.begin(), buf.begin() + head); head = 0; }
++				if (clk::now() - statTick >= std::chrono::seconds(5)) {
++					SsbBridge::log("audio: %.0f chunks/s sent (100 = real time), underruns %u, shed %u, worst submit lateness %.1f ms, buffered %.0f ms",
++						sent / 5.0, underruns, shed, maxLateMs, (buf.size() - head) / 2.0 / 48.0);
++					sent = underruns = shed = 0; maxLateMs = 0; statTick = clk::now();
++				}
++			} else {
++				buf.clear(); head = 0; primed = false;
++			}
++			Sleep(1);
++		}
++	});
++
+ 	while (_isRunning)
+ 	{
+ 		const bool usePacing = Config::cfg.video.framePacing;
+@@ -977,7 +1068,10 @@
+ 
+ 		_dx11.captureScreen(_parsec);
+ 
+-		if (audioIn.isEnabled) {
++
++		// Linux bridge: desktop audio is pumped by its own thread (see bridgeAudioThread above).
++		const bool bridgeOut = audioOut.isEnabled && SsbAudio::active();
++		if (!bridgeOut && audioIn.isEnabled) {
+ 			audioIn.captureAudio();
+ 			drainSource(audioIn, pendingIn);
+ 		}
+@@ -985,7 +1079,7 @@
+ 			pendingIn.clear();
+ 		}
+ 
+-		if (audioOut.isEnabled) {
++		if (!bridgeOut && audioOut.isEnabled) {
+ 			audioOut.captureAudio();
+ 			drainSource(audioOut, pendingOut);
+ 		}
+@@ -993,71 +1087,75 @@
+ 			pendingOut.clear();
+ 		}
+ 
+-		auto submitBuffer = [&](const std::vector<int16_t>& buffer) {
+-			if (buffer.empty()) {
+-				return;
+-			}
++		if (!bridgeOut) {
++			auto submitBuffer = [&](const std::vector<int16_t>& buffer) {
++				if (buffer.empty()) {
++					return;
++				}
+ 
+-			ParsecHostSubmitAudio(_parsec, PCM_FORMAT_INT16, SAFE_FREQUENCY, buffer.data(), static_cast<uint32_t>(buffer.size() / 2));
+-		};
++				ParsecHostSubmitAudio(_parsec, PCM_FORMAT_INT16, SAFE_FREQUENCY, buffer.data(), static_cast<uint32_t>(buffer.size() / 2));
++			};
+ 
+-		auto now = std::chrono::steady_clock::now();
+-		double elapsedSeconds = std::chrono::duration<double>(now - lastAudioTick).count();
+-		lastAudioTick = now;
+-		audioFrameBudget += elapsedSeconds * static_cast<double>(SAFE_FREQUENCY);
+-
+-		// Bound catch-up to avoid runaway submission bursts after long stalls.
+-		const double maxFrameBudget = static_cast<double>(SUBMIT_CHUNK_FRAMES * 6);
+-		if (audioFrameBudget > maxFrameBudget) {
+-			audioFrameBudget = maxFrameBudget;
+-		}
++			auto now = std::chrono::steady_clock::now();
++			double elapsedSeconds = std::chrono::duration<double>(now - lastAudioTick).count();
++			lastAudioTick = now;
++			audioFrameBudget += elapsedSeconds * static_cast<double>(SAFE_FREQUENCY);
++
++			// Bound catch-up to avoid runaway submission bursts after long stalls.
++			const double maxFrameBudget = static_cast<double>(SUBMIT_CHUNK_FRAMES * 6);
++			if (audioFrameBudget > maxFrameBudget) {
++				audioFrameBudget = maxFrameBudget;
++			}
+ 
+-		size_t submittedChunks = 0;
+-		while (audioFrameBudget >= static_cast<double>(SUBMIT_CHUNK_FRAMES) && submittedChunks < 6)
+-		{
+-			if (audioIn.isEnabled && audioOut.isEnabled)
++			size_t submittedChunks = 0;
++			while (audioFrameBudget >= static_cast<double>(SUBMIT_CHUNK_FRAMES) && submittedChunks < 6)
+ 			{
+-				bool hasIn = false;
+-				bool hasOut = false;
+-				std::vector<int16_t> inChunk = popPendingChunk(pendingIn, &hasIn);
+-				std::vector<int16_t> outChunk = popPendingChunk(pendingOut, &hasOut);
+-
+-				if (hasIn && hasOut) {
+-					const std::vector<int16_t>& mixBuffer = _audioMix.mix(inChunk, outChunk);
+-					submitBuffer(mixBuffer);
++				if (audioIn.isEnabled && audioOut.isEnabled)
++				{
++					bool hasIn = false;
++					bool hasOut = false;
++					std::vector<int16_t> inChunk = popPendingChunk(pendingIn, &hasIn);
++					std::vector<int16_t> outChunk = popPendingChunk(pendingOut, &hasOut);
++
++					if (hasIn && hasOut) {
++						const std::vector<int16_t>& mixBuffer = _audioMix.mix(inChunk, outChunk);
++						submitBuffer(mixBuffer);
++					}
++					else if (hasOut) {
++						submitBuffer(outChunk);
++					}
++					else if (hasIn) {
++						submitBuffer(inChunk);
++					}
++					else {
++						submitBuffer(silenceChunk);
++					}
+ 				}
+-				else if (hasOut) {
+-					submitBuffer(outChunk);
++				else if (audioOut.isEnabled)
++				{
++					submitBuffer(popPendingChunk(pendingOut));
+ 				}
+-				else if (hasIn) {
+-					submitBuffer(inChunk);
++				else if (audioIn.isEnabled)
++				{
++					submitBuffer(popPendingChunk(pendingIn));
+ 				}
+ 				else {
+ 					submitBuffer(silenceChunk);
+ 				}
+-			}
+-			else if (audioOut.isEnabled)
+-			{
+-				submitBuffer(popPendingChunk(pendingOut));
+-			}
+-			else if (audioIn.isEnabled)
+-			{
+-				submitBuffer(popPendingChunk(pendingIn));
+-			}
+-			else {
+-				submitBuffer(silenceChunk);
++
++				audioFrameBudget -= static_cast<double>(SUBMIT_CHUNK_FRAMES);
++				submittedChunks++;
+ 			}
+ 
+-			audioFrameBudget -= static_cast<double>(SUBMIT_CHUNK_FRAMES);
+-			submittedChunks++;
+-		}
++			if (submittedChunks == 0) {
++				submitSilence();
++			}
+ 
+-		if (submittedChunks == 0) {
+-			submitSilence();
+ 		}
+ 
+-		// Sleep until next frame time for even pacing
+-		if (usePacing && frameIntervalSec > 0.0) {
++		// Sleep until next frame time for even pacing (not with the Linux bridge: capture waits for frames)
++		if (_dx11.isBridgePaced()) {
++		} else if (usePacing && frameIntervalSec > 0.0) {
+ 			auto elapsed = std::chrono::steady_clock::now() - frameStart;
+ 			double elapsedSec = std::chrono::duration<double>(elapsed).count();
+ 			double remainingSec = frameIntervalSec - elapsedSec;
+@@ -1070,6 +1168,9 @@
+ 		}
+ 	}
+ 
++	bridgeAudioStop = true;
++	if (bridgeAudioThread.joinable()) bridgeAudioThread.join();
++
+ #ifdef _WIN32
+ 	timeEndPeriod(1);
+ #endif
+@@ -1095,6 +1196,7 @@
+ 	_eventMutex.lock();
+ 
+ 	ParsecHostStop(_parsec);
++	SsbBridge::setCaptureWanted(false);
+ 	_isRunning = false;
+ 
+ 	_mediaMutex.unlock();
+@@ -1127,6 +1229,7 @@
+ 			Guest guest = Guest(parsecGuest.name, parsecGuest.userID, parsecGuest.id);
+ 			guestCount = ParsecHostGetGuests(_parsec, GUEST_CONNECTED, &guests);
+ 			GuestList::instance.setGuests(guests, guestCount);
++			SsbBridge::setGuestCount(static_cast<unsigned>(guestCount));
+ 			//logMessage("event: " + to_string(event.type) + " guest: " + guest.name + " state: " + to_string(state) + " status: " + to_string(event.guestStateChange.status));
+ 
+ 			switch (event.type)
+@@ -1207,6 +1310,29 @@
+ }
+ 
+ /**
++ * Keeps the configured "excluded app" (Config::cfg.audio.excludedAppExe, e.g. Discord)
++ * out of the speaker loopback audio that gets streamed to guests. Re-resolves the PID
++ * by name each time it's called so it recovers if that app was restarted (new PID).
++ * A dead/closed target process is harmless to stay "excluded" against: with nothing left
++ * rendering under that PID, process-loopback capture just behaves like normal loopback.
++ */
++void Hosting::refreshAudioExclusion() {
++	const std::string exeName = Config::cfg.audio.excludedAppExe;
++
++	if (exeName.empty()) {
++		if (audioOut.getExcludedProcessId() != 0) {
++			audioOut.setDevice(static_cast<int>(audioOut.currentDevice.index));
++		}
++		return;
++	}
++
++	DWORD pid = AudioProcessLoopback::FindRunningProcessIdByName(exeName);
++	if (pid != 0 && pid != audioOut.getExcludedProcessId()) {
++		audioOut.setDeviceExcludingProcess(pid);
++	}
++}
++
++/**
+  * Polls Smash Soda specific functionality.
+  */
+ void Hosting::pollSmashSoda() {
+@@ -1216,6 +1342,13 @@
+ 
+ 		Sleep(100);
+ 
++		// Re-check every few seconds in case the excluded app (e.g. Discord) was
++		// just launched, or was restarted and got a new PID.
++		if (_audioExcludeClock.isFinished()) {
++			refreshAudioExclusion();
++			_audioExcludeClock.reset();
++		}
++
+ 		// Handles all the automatic button press stuff
+ 		_macro.run();
+ 
+@@ -1360,6 +1493,25 @@
+ 	{
+ 		if (ParsecHostPollInput(_parsec, 4, &inputGuest, &inputGuestMsg))
+ 		{
++			// Linux bridge diagnostics: how regularly do guest controller messages arrive from Parsec?
++			if (inputGuestMsg.type == MESSAGE_GAMEPAD_STATE || inputGuestMsg.type == MESSAGE_GAMEPAD_AXIS || inputGuestMsg.type == MESSAGE_GAMEPAD_BUTTON) {
++				static LARGE_INTEGER freq = []() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
++				static double lastMs = 0, maxGap = 0, windowStart = 0; static int count = 0, over20 = 0, over50 = 0;
++				LARGE_INTEGER now; QueryPerformanceCounter(&now);
++				const double ms = now.QuadPart * 1000.0 / freq.QuadPart;
++				if (lastMs > 0) { const double gap = ms - lastMs; if (gap > maxGap) maxGap = gap; if (gap > 20) over20++; if (gap > 50) over50++; }
++				static int steady = 0;
++				if (lastMs > 0 && ms - lastMs > 40 && steady >= 30) SsbBridge::log("STALL: no controller message for %.0f ms during steady input", ms - lastMs);
++				steady = (lastMs > 0 && ms - lastMs < 20) ? steady + 1 : 0;
++				lastMs = ms; count++;
++				if (windowStart == 0) windowStart = ms;
++				if (ms - windowStart >= 5000) {
++					SsbBridge::log("input: %.0f guest controller msgs/s from Parsec, max gap %.0f ms, gaps >20ms: %d, >50ms: %d",
++						count * 1000.0 / (ms - windowStart), maxGap, over20, over50);
++					count = over20 = over50 = 0; maxGap = 0; windowStart = ms;
++				}
++			}
++
+ 			Guest guest;
+ 			bool hasGuest = GuestList::instance.find(inputGuest.userID, &guest);
+ 			bool allowKeyboard = inputGuest.perms.keyboard;
+@@ -1412,6 +1564,16 @@
+ bool Hosting::roomStart() {
+ 	
+ 	if (isReady()) {
++		if (SsbBridge::linuxMode()) {
++			// Tell the Linux helper which stream resolution to produce (0,0 = the display's native resolution).
++			int w = 0, h = 0;
++			const size_t idx = Config::cfg.video.resolutionIndex;
++			if (idx > 0 && idx < Config::cfg.resolutions.size()) { w = Config::cfg.resolutions[idx].width; h = Config::cfg.resolutions[idx].height; }
++			SsbBridge::setWantedResolution(w, h);
++			SsbBridge::setBitrateBudget(Config::cfg.video.bandwidth * 1000);
++			SsbBridge::setCaptureOptions(Config::cfg.video.linuxCapture, Config::cfg.video.linuxSource, Config::cfg.video.rememberScreen);
++		}
++		SsbBridge::setCaptureWanted(true);
+ 		ParsecStatus status = ParsecHostStart(_parsec, HOST_DESKTOP, &_hostConfig, _parsecSession.sessionId.c_str());
+ 		Sleep(2000);
+ 		ParsecHostStop(_parsec);
+@@ -1652,6 +1814,7 @@
+  * @param status The status of the state change.
+  */
+ void Hosting::onGuestStateChange(ParsecGuestState& state, Guest& guest, ParsecStatus& status) {
++	SsbBridge::log("guest event: state %d (1=connecting 2=connected 4=disconnected 8=failed) status %d, guests now %d", (int)state, (int)status, (int)GuestList::instance.getGuests().size());
+ 	switch (state) {
+ 		case GUEST_CONNECTING:
+ 			handleGuestIpAddress(guest);
+diff -ruN a/SmashSoda/Hosting.h b/SmashSoda/Hosting.h
+--- a/SmashSoda/Hosting.h	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/Hosting.h	2026-10-14 06:30:22.798756054 -0400
+@@ -147,6 +147,7 @@
+ 	void pollInputs();
+ 	void pollLatency();
+ 	void pollSmashSoda();	// Custom features thread
++	void refreshAudioExclusion();
+ 	bool roomStart();
+ 	bool isFilteredCommand(ACommand* command);
+ 
+@@ -199,6 +200,7 @@
+ 
+ 	Stopwatch _mediaClock;
+ 	Stopwatch _welcomeClock;
++	Stopwatch _audioExcludeClock = Stopwatch(3000);
+ 
+ 	string _welcomeGuest;
+ 	bool _showWelcome = false;
+diff -ruN a/SmashSoda/Main.cpp b/SmashSoda/Main.cpp
+--- a/SmashSoda/Main.cpp	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/Main.cpp	2026-10-14 06:30:22.799212954 -0400
+@@ -1,4 +1,5 @@
+-﻿// Dear ImGui: standalone example application for DirectX 11
++﻿#include "linux/SsbBridge.h"
++// Dear ImGui: standalone example application for DirectX 11
+ // If you are new to Dear ImGui, read documentation from the docs/ folder + read the top of imgui.cpp.
+ // Read online: https://github.com/ocornut/imgui/tree/master/docs
+ 
+@@ -348,8 +349,19 @@
+ 
+     // =====================================================================
+ 
++    SsbBridge::installCrashLogger();
++
+     // Main loop
+     bool done = false;
++    // UI frame limiter + stats. Present(1) is expected to pace the loop, but under Wine it can return
++    // immediately, leaving the UI redrawing flat out (a DXVK submit thread pegged at ~90% CPU) while Parsec
++    // is trying to share the same D3D11 device. Cap it; tune live with "ui_fps=N" in tuning.txt (0 = off).
++    timeBeginPeriod(1);
++    LARGE_INTEGER uiFreq; QueryPerformanceFrequency(&uiFreq);
++    double uiNext = 0, uiStatStart = 0; int uiFrames = 0;
++    double lastInputMs = 0;   // last time the window got mouse/keyboard input
++    double uiHzCheckMs = -10000.0; int uiMonitorHz = 60;
++    auto uiNowMs = [&]() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / uiFreq.QuadPart; };
+     while (!done)
+     {
+         // Poll and handle messages (inputs, window resize, etc.)
+@@ -360,6 +372,10 @@
+         MSG msg;
+         while (::PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE))
+         {
++            if ((msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST) || (msg.message >= WM_MOUSEFIRST && msg.message <= WM_MOUSELAST) ||
++                msg.message == WM_SETFOCUS || msg.message == WM_SIZE || msg.message == WM_MOVE) {
++                LARGE_INTEGER t; QueryPerformanceCounter(&t); lastInputMs = t.QuadPart * 1000.0 / uiFreq.QuadPart;
++            }
+             ::TranslateMessage(&msg);
+             ::DispatchMessage(&msg);
+             if (msg.message == WM_QUIT)
+@@ -486,6 +502,40 @@
+         else {
+             presentFlags = 0;
+         }
++
++        {
++            const double now = uiNowMs();
++            // Full rate while the window is being used, a low idle rate otherwise (the panel is mostly static
++            // while hosting; redrawing it at 60 fps cost ~20% of the GPU).
++            // Full rate = the refresh rate of the monitor the window is on (re-read every 2 s, so dragging it to
++            // another screen follows); "ui_fps" in tuning.txt overrides it.
++            if (now - uiHzCheckMs > 2000.0) {
++                uiHzCheckMs = now;
++                int hz = 60;
++                if (HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) {
++                    MONITORINFOEXA mi = {}; mi.cbSize = sizeof(mi);
++                    DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
++                    if (GetMonitorInfoA(mon, &mi) && EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
++                        hz = (int)dm.dmDisplayFrequency;
++                }
++                uiMonitorHz = hz < 30 ? 30 : (hz > 480 ? 480 : hz);
++            }
++            const bool inUse = lastInputMs > 0 && now - lastInputMs < 1500.0;
++            const int uiFps = inUse ? SsbBridge::tuningInt("ui_fps", uiMonitorHz) : SsbBridge::tuningInt("ui_idle_fps", 15);
++            uiFrames++;
++            if (uiStatStart == 0) uiStatStart = now;
++            if (now - uiStatStart >= 5000) {
++                SsbBridge::log("ui: %.1f frames/s (limit %d)", uiFrames * 1000.0 / (now - uiStatStart), uiFps);
++                uiFrames = 0; uiStatStart = now;
++            }
++            if (uiFps > 0) {
++                const double interval = 1000.0 / uiFps;
++                if (uiNext == 0 || uiNext < now - 100) uiNext = now;   // fell far behind: restart the schedule
++                uiNext += interval;
++                for (double rem = uiNext - uiNowMs(); rem > 0; rem = uiNext - uiNowMs())
++                    Sleep(rem > 2.0 ? (DWORD)(rem - 1.0) : 1);
++            }
++        }
+     }
+ 
+     // Cleanup
+diff -ruN a/SmashSoda/pch.h b/SmashSoda/pch.h
+--- a/SmashSoda/pch.h	2026-10-14 06:21:28.153101524 -0400
++++ b/SmashSoda/pch.h	2026-10-14 06:30:22.897063511 -0400
+@@ -1,5 +1,9 @@
+ #pragma once
+ 
++#ifdef SSB_LINUX
++#include "linux/mingw_compat.h"
++#endif
++
+ // Standard Library
+ #include <iostream>
+ #include <string>
+diff -ruN a/SmashSoda/services/Arcade.cpp b/SmashSoda/services/Arcade.cpp
+--- a/SmashSoda/services/Arcade.cpp	2026-10-14 06:21:28.153101524 -0400
++++ b/SmashSoda/services/Arcade.cpp	2026-10-14 06:30:22.897332938 -0400
+@@ -45,6 +45,7 @@
+ 		}
+ 	}
+ 
++	return false;
+ }
+ 
+ /**
+diff -ruN a/SmashSoda/services/InputControlService.cpp b/SmashSoda/services/InputControlService.cpp
+--- a/SmashSoda/services/InputControlService.cpp	2026-10-14 06:21:28.153296807 -0400
++++ b/SmashSoda/services/InputControlService.cpp	2026-10-14 06:30:22.897906972 -0400
+@@ -1,5 +1,6 @@
+ #include "InputControlService.h"
+ #include "../core/Config.h"
++#include "../linux/SsbInput.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -385,6 +386,10 @@
+ }
+ 
+ bool InputControlService::sendMouseInput(DWORD flags, DWORD mouseData) const {
++    if (SsbInput::active()) {
++        return SsbInput::mouseButton(flags, mouseData);
++    }
++
+     INPUT input = {};
+     input.type = INPUT_MOUSE;
+     input.mi.dwFlags = flags;
+@@ -394,6 +399,10 @@
+ }
+ 
+ bool InputControlService::sendKeyboardInput(WORD virtualKey, DWORD flags) const {
++    if (SsbInput::active()) {
++        return SsbInput::key(virtualKey, (flags & KEYEVENTF_EXTENDEDKEY) != 0, (flags & KEYEVENTF_KEYUP) == 0);
++    }
++
+     INPUT input = {};
+     input.type = INPUT_KEYBOARD;
+     input.ki.wVk = virtualKey;
+@@ -472,6 +481,22 @@
+ }
+ 
+ bool InputControlService::handleParsecMouseMotion(const ParsecMouseMotionMessage& mouseMotion) const {
++    if (SsbInput::active()) {
++        if (mouseMotion.relative) {
++            return SsbInput::mouseRelative(mouseMotion.x, mouseMotion.y);
++        }
++
++        int streamW = 0, streamH = 0;
++        SsbInput::captureSize(streamW, streamH);
++        const size_t resolutionIndex = Config::cfg.video.resolutionIndex;
++        if (resolutionIndex > 0 && resolutionIndex < Config::cfg.resolutions.size()) {
++            const int cw = Config::cfg.resolutions[resolutionIndex].width;
++            const int ch = Config::cfg.resolutions[resolutionIndex].height;
++            if (cw > 0 && ch > 0) { streamW = cw; streamH = ch; }
++        }
++        return SsbInput::mouseAbsolute(mouseMotion.x, mouseMotion.y, streamW, streamH);
++    }
++
+     if (mouseMotion.relative) {
+         INPUT input = {};
+         input.type = INPUT_MOUSE;
+diff -ruN a/SmashSoda/SmashSoda.vcxproj b/SmashSoda/SmashSoda.vcxproj
+--- a/SmashSoda/SmashSoda.vcxproj	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/SmashSoda.vcxproj	2026-10-14 06:30:22.799666652 -0400
+@@ -254,6 +254,7 @@
+     <ClCompile Include="AudioIn.cpp" />
+     <ClCompile Include="AudioMix.cpp" />
+     <ClCompile Include="AudioOut.cpp" />
++    <ClCompile Include="AudioProcessLoopback.cpp" />
+     <ClCompile Include="Lists\BanList.cpp" />
+     <ClCompile Include="Helpers\Bitwise.cpp" />
+     <ClCompile Include="ChatLog.cpp" />
+@@ -441,6 +442,7 @@
+     <ClInclude Include="AudioIn.h" />
+     <ClInclude Include="AudioMix.h" />
+     <ClInclude Include="AudioOut.h" />
++    <ClInclude Include="AudioProcessLoopback.h" />
+     <ClInclude Include="Lists\BanList.h" />
+     <ClInclude Include="Chatbot\ChatBot.h" />
+     <ClInclude Include="Chatbot\Commands\God\CommandPublic.h" />
+diff -ruN a/SmashSoda/SmashSoda.vcxproj.filters b/SmashSoda/SmashSoda.vcxproj.filters
+--- a/SmashSoda/SmashSoda.vcxproj.filters	2026-10-14 06:21:28.089508905 -0400
++++ b/SmashSoda/SmashSoda.vcxproj.filters	2026-10-14 06:30:22.799897825 -0400
+@@ -24,6 +24,9 @@
+     <ClCompile Include="AudioOut.cpp">
+       <Filter>Source Files</Filter>
+     </ClCompile>
++    <ClCompile Include="AudioProcessLoopback.cpp">
++      <Filter>Source Files</Filter>
++    </ClCompile>
+     <ClCompile Include="Helpers\Dice.cpp">
+       <Filter>Source Files</Filter>
+     </ClCompile>
+@@ -356,6 +359,9 @@
+     <ClInclude Include="AudioOut.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
++    <ClInclude Include="AudioProcessLoopback.h">
++      <Filter>Header Files</Filter>
++    </ClInclude>
+     <ClInclude Include="Chatbot\ChatBot.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
+diff -ruN a/SmashSoda/WGCapture.cpp b/SmashSoda/WGCapture.cpp
+--- a/SmashSoda/WGCapture.cpp	2026-10-14 06:21:28.090165368 -0400
++++ b/SmashSoda/WGCapture.cpp	2026-10-14 06:30:22.800138276 -0400
+@@ -1,3 +1,17 @@
++#ifdef SSB_LINUX
++// Windows Graphics Capture needs WinRT; under Wine the Linux bridge supplies frames instead.
++#include "WGCapture.h"
++
++struct WGCapture::Impl {};
++WGCapture::WGCapture() : _impl(nullptr) {}
++WGCapture::~WGCapture() {}
++bool WGCapture::isSupported() { return false; }
++bool WGCapture::start(ID3D11Device*, ID3D11DeviceContext*, HMONITOR) { return false; }
++void WGCapture::stop() {}
++bool WGCapture::isActive() const { return false; }
++ID3D11Texture2D* WGCapture::acquireFrame() { return nullptr; }
++void WGCapture::getFrameSize(int& width, int& height) const { width = height = 0; }
++#else
+ #pragma warning(push)
+ #pragma warning(disable: 4265 4946 4100)
+ 
+@@ -282,3 +296,4 @@
+ 	width = _impl->frameWidth;
+ 	height = _impl->frameHeight;
+ }
++#endif // SSB_LINUX
+diff -ruN a/SmashSoda/widgets/AudioSettingsWidget.cpp b/SmashSoda/widgets/AudioSettingsWidget.cpp
+--- a/SmashSoda/widgets/AudioSettingsWidget.cpp	2026-10-14 06:21:28.155308428 -0400
++++ b/SmashSoda/widgets/AudioSettingsWidget.cpp	2026-10-14 06:30:22.901213998 -0400
+@@ -1,4 +1,5 @@
+ #include "AudioSettingsWidget.h"
++#include "../linux/SsbBridge.h"
+ #include "../services/ThemeController.h"
+ 
+ AudioSettingsWidget::AudioSettingsWidget(Hosting& hosting)
+@@ -21,6 +22,114 @@
+     startWidget("Audio", showWindow, 450, 450, 450, 450);
+     startBody(false);
+ 
++    if (SsbBridge::linuxMode()) {
++        // Linux build: guests hear the desktop's default output, captured by the Linux helper. There is no
++        // microphone/speaker device to choose and no per-app exclusion, so only volume and mute are offered.
++        AppFonts::pushTitle();
++        AppColors::pushInput();
++        ImGui::Text("Desktop audio");
++        AppColors::pop();
++        AppFonts::pop();
++        ImGui::Dummy(ImVec2(0.0f, 5.0f));
++
++        static int desktopVolume;
++        static float desktopPreview = 0.0f, desktopTarget = 0.0f;
++        desktopVolume = (int)(100.0f * _audioOut.volume);
++        desktopTarget = AudioTools::decibelToFloat(_audioOut.peekPreviewDecibel());
++        desktopPreview = lerp(desktopPreview, desktopTarget, easing(desktopTarget - desktopPreview));
++        if (AudioControlWidget::render("Speakers##Audio Out", &desktopVolume, _audioOut.isEnabled, desktopPreview, AppIcons::speakersOn, AppIcons::speakersOff)) {
++            _audioOut.isEnabled = !_audioOut.isEnabled;
++            Config::cfg.audio.speakersEnabled = _audioOut.isEnabled;
++        }
++        _audioOut.volume = (float)desktopVolume / 100.0f;
++        Config::cfg.audio.speakersVolume = (float)desktopVolume;
++
++        ImGui::Dummy(ImVec2(0.0f, 10.0f));
++        TooltipWidget::render("Guests hear whatever your desktop plays. Pick the output device in your system sound settings.");
++
++        // =============================================================
++        //  Every app that is making sound: its own volume, mute, and whether guests hear it.
++        //  (Volume and mute change the app's sound for you too; "Share" off keeps it out of the guests' audio
++        //  while you still hear it.)
++        // =============================================================
++        ImGui::Dummy(ImVec2(0.0f, 14.0f));
++        AppFonts::pushTitle();
++        AppColors::pushInput();
++        ImGui::Text("Apps playing audio");
++        AppColors::pop();
++        AppFonts::pop();
++        ImGui::Dummy(ImVec2(0.0f, 5.0f));
++
++        ssb_apps* apps = SsbBridge::appsAlive() ? SsbBridge::apps() : nullptr;
++        if (!apps) {
++            ImGui::TextDisabled("The app list is not available (is the Linux audio helper running?).");
++        }
++        else if (apps->count == 0) {
++            ImGui::TextDisabled("No app is playing audio right now.");
++        }
++        else {
++            struct Pending { int value = 0; bool dirty = false; double holdUntil = 0; };
++            static std::map<uint32_t, Pending> pending;
++            const double nowSec = ImGui::GetTime();
++            const float fullWidth = ImGui::GetContentRegionAvail().x;
++            const uint32_t count = apps->count < SSB_APPS_MAX ? apps->count : SSB_APPS_MAX;
++            for (uint32_t i = 0; i < count; i++) {
++                const ssb_app_entry e = apps->apps[i];
++                ImGui::PushID((int)e.id);
++                ImGui::TextUnformatted(e.name);
++
++                Pending& p = pending[e.id];
++                int vol = (nowSec < p.holdUntil) ? p.value : (int)e.volume;   // keep the dragged value until the helper catches up
++                Theme* theme = ThemeController::getInstance().getActiveTheme();
++                ImGui::SetNextItemWidth(fullWidth - 175.0f);
++                ImGui::PushStyleColor(ImGuiCol_FrameBg, theme->formInputBackground);
++                ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, theme->formInputBackground);
++                ImGui::PushStyleColor(ImGuiCol_FrameBgActive, theme->formInputBackground);
++                ImGui::PushStyleColor(ImGuiCol_SliderGrab, theme->sliderGrab);
++                ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, theme->sliderGrabActive);
++                ImGui::PushStyleColor(ImGuiCol_Text, theme->formInputText);
++                if (ImGui::SliderInt("##vol", &vol, 0, 100, "%d%%")) {
++                    p.value = vol; p.dirty = true; p.holdUntil = nowSec + 1.5;
++                }
++                ImGui::PopStyleColor(6);
++                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
++                if (p.dirty && SsbBridge::appsCommand(SSB_APPCMD_VOLUME, e.id, p.value)) p.dirty = false;
++
++                // Mute and Share are real buttons with a filled background that changes colour with their state.
++                auto toggle = [&](const char* label, bool on, const ImVec4& onColor, const char* tip) {
++                    const ImVec4 offColor = theme->formInputBackground;
++                    const ImVec4 c = on ? onColor : offColor;
++                    ImGui::PushStyleColor(ImGuiCol_Button, c);
++                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(c.x + 0.08f, c.y + 0.08f, c.z + 0.08f, c.w));
++                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(c.x + 0.14f, c.y + 0.14f, c.z + 0.14f, c.w));
++                    ImGui::PushStyleColor(ImGuiCol_Text, theme->formInputText);
++                    const bool clicked = ImGui::Button(label, ImVec2(76.0f, 0.0f));
++                    ImGui::PopStyleColor(4);
++                    if (ImGui::IsItemHovered()) { ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); ImGui::SetTooltip("%s", tip); }
++                    return clicked;
++                };
++
++                ImGui::SameLine();
++                const bool muted = e.muted != 0;
++                if (toggle(muted ? "Muted" : "Mute", muted, theme->negative, "Silence this app for you and for guests."))
++                    SsbBridge::appsCommand(SSB_APPCMD_MUTE, e.id, muted ? 0 : 1);
++                ImGui::SameLine();
++                const bool shared = e.shared != 0;
++                if (toggle(shared ? "Shared" : "Host only", shared, theme->positive,
++                           shared ? "Guests hear this app. Click to keep it out of the stream while you still hear it."
++                                  : "Only you hear this app. Click to let guests hear it too."))
++                    SsbBridge::appsCommand(SSB_APPCMD_SHARE, e.id, shared ? 0 : 1);
++                if (!e.playing) { ImGui::SameLine(); ImGui::TextDisabled("(paused)"); }
++                ImGui::PopID();
++                ImGui::Dummy(ImVec2(0.0f, 4.0f));
++            }
++        }
++
++        endBody();
++        endWidget();
++        return true;
++    }
++
+     if (!_hosting.isRunning() && _hosting.isReady()) {
+         _audioIn.captureAudio();
+         _audioOut.captureAudio();
+@@ -127,6 +236,51 @@
+     _audioOut.volume = (float)speakersVolume / 100.0f;
+     Config::cfg.audio.speakersVolume = (float)speakersVolume;
+ 
++    ImGui::Dummy(ImVec2(0, 10));
++
++    // =============================================================
++    //  Exclude an app's own audio from what guests hear
++    //  (fixes guests hearing an echo of themselves through voice chat)
++    // =============================================================
++    static vector<AudioSessionApp> excludeCandidates;
++    static Stopwatch excludeRefreshClock = Stopwatch(2000);
++    if (excludeCandidates.empty() || excludeRefreshClock.isFinished()) {
++        excludeCandidates = AudioProcessLoopback::ListAudioSessionApps();
++        excludeRefreshClock.reset();
++    }
++
++    std::vector<std::pair<std::string, std::string>> excludeOptions;
++    excludeOptions.push_back({ "", "None" });
++
++    bool currentIsListed = Config::cfg.audio.excludedAppExe.empty();
++    for (const AudioSessionApp& app : excludeCandidates) {
++        excludeOptions.push_back({ app.exeName, app.exeName });
++        if (app.exeName == Config::cfg.audio.excludedAppExe) currentIsListed = true;
++    }
++    // Keep a previously chosen app selectable even while it isn't making sound right now.
++    if (!currentIsListed) {
++        excludeOptions.push_back({ Config::cfg.audio.excludedAppExe, Config::cfg.audio.excludedAppExe + " (not running)" });
++    }
++
++    string excludeCallback = Config::cfg.audio.excludedAppExe;
++    if (elSelect("Exclude From Shared Audio", excludeOptions, excludeCallback,
++        "Keeps an app's own sound out of what guests hear. Pick your voice chat app (e.g. Discord) "
++        "so people don't hear an echo of themselves through the stream. While active, guests hear "
++        "your default Windows output device, regardless of the Output Source above.")) {
++        Config::cfg.audio.excludedAppExe = excludeCallback;
++        Config::cfg.Save();
++
++        if (excludeCallback.empty()) {
++            _audioOut.setDevice(static_cast<int>(currentOutputDevice));
++        }
++        else {
++            DWORD pid = AudioProcessLoopback::FindRunningProcessIdByName(excludeCallback);
++            if (pid != 0) {
++                _audioOut.setDeviceExcludingProcess(pid);
++            }
++        }
++    }
++
+     ImGui::Dummy(ImVec2(0, 20));
+ 
+     if (showPlot) {
+diff -ruN a/SmashSoda/widgets/AudioSettingsWidget.h b/SmashSoda/widgets/AudioSettingsWidget.h
+--- a/SmashSoda/widgets/AudioSettingsWidget.h	2026-10-14 06:21:28.155308428 -0400
++++ b/SmashSoda/widgets/AudioSettingsWidget.h	2026-10-14 06:30:22.901405493 -0400
+@@ -4,6 +4,7 @@
+ #include "../imgui/implot.h"
+ #include "../Hosting.h"
+ #include "../AudioTools.h"
++#include "../AudioProcessLoopback.h"
+ #include "../globals/AppIcons.h"
+ #include "../globals/AppFonts.h"
+ #include "ToggleIconButtonWidget.h"
+diff -ruN a/SmashSoda/widgets/HostSettingsWidget.cpp b/SmashSoda/widgets/HostSettingsWidget.cpp
+--- a/SmashSoda/widgets/HostSettingsWidget.cpp	2026-10-14 06:21:28.155308428 -0400
++++ b/SmashSoda/widgets/HostSettingsWidget.cpp	2026-10-14 06:30:22.902607757 -0400
+@@ -1,4 +1,5 @@
+ #include "HostSettingsWidget.h"
++#include "../linux/SsbBridge.h"
+ #include "../ImGui/imform.h"
+ #include "../services/OverlayService.h"
+ 
+@@ -296,6 +297,7 @@
+         }
+     }
+ 
++    if (!SsbBridge::linuxMode()) {   // the overlay is a Windows-only helper app
+     if (elCheckbox("Overlay", Config::cfg.overlay.enabled, "Show the overlay when hosting to see chat and guest info (useful if you only have one monitor).")) {
+         if (_hosting.isRunning()) {
+             if (Config::cfg.overlay.enabled) {
+@@ -306,6 +308,7 @@
+             }
+         }
+     }
++    }
+ 
+     if (elCheckbox("Latency Limiter", _latencyLimiter, "Limit the maximum latency for guests.")) {
+         if (_hosting.isRunning()) {
+@@ -355,6 +358,19 @@
+             }
+             ImGui::SameLine();
+         }
++
++        if (SsbBridge::linuxMode()) {
++            // Switch to another screen or window without stopping the room (nobody gets kicked).
++            const ssb_video* cap = SsbBridge::video();
++            if (cap && cap->state == SSB_CAP_WAITING) {
++                ImGui::AlignTextToFramePadding();
++                ImGui::TextDisabled("Choose the new screen in the share window...");
++            }
++            else if (elBtn("Change Screen")) {
++                SsbBridge::requestChangeScreen();
++            }
++            ImGui::SameLine();
++        }
+ 
+         if (elBtnSecondary("Stop Hosting")) {
+             _popupTitle = "Stop Hosting";
+diff -ruN a/SmashSoda/widgets/TitleTooltipWidget.cpp b/SmashSoda/widgets/TitleTooltipWidget.cpp
+--- a/SmashSoda/widgets/TitleTooltipWidget.cpp	2026-10-14 06:21:28.156170681 -0400
++++ b/SmashSoda/widgets/TitleTooltipWidget.cpp	2026-10-14 06:30:22.904235835 -0400
+@@ -28,6 +28,7 @@
+ 
+ 		return true;
+ 	}
++	return false;
+ }
+ 
+ 
+diff -ruN a/SmashSoda/widgets/TooltipWidget.cpp b/SmashSoda/widgets/TooltipWidget.cpp
+--- a/SmashSoda/widgets/TooltipWidget.cpp	2026-10-14 06:21:28.156170681 -0400
++++ b/SmashSoda/widgets/TooltipWidget.cpp	2026-10-14 06:30:22.904475514 -0400
+@@ -10,6 +10,7 @@
+ 		ImGui::SetTooltip(text);
+ 		return true;
+ 	}
++	return false;
+ }
+ 
+ 
+diff -ruN a/SmashSoda/widgets/VideoWidget.cpp b/SmashSoda/widgets/VideoWidget.cpp
+--- a/SmashSoda/widgets/VideoWidget.cpp	2026-10-14 06:21:28.156170681 -0400
++++ b/SmashSoda/widgets/VideoWidget.cpp	2026-10-14 06:30:22.904868794 -0400
+@@ -1,4 +1,5 @@
+ #include "VideoWidget.h"
++#include "../linux/SsbBridge.h"
+ 
+ VideoWidget::VideoWidget(Hosting& hosting)
+     : _hosting(hosting), _dx11(_hosting.getDX11())
+@@ -18,10 +19,15 @@
+     startWidget("Video", showWindow, 450, 450, 450, 450);
+     startBody(false);
+ 
++    // Linux build: the screen is picked when you press Host, the GPU is the one driving your display, and frames
++    // are captured through the desktop portal - so the Windows capture/monitor/adapter settings do not exist.
++    const bool linuxMode = SsbBridge::linuxMode();
++
++    static UINT currentScreen = 0;
++    if (!linuxMode) {
+     // =========================================================
+     // Monitors
+     // =========================================================
+-    static UINT currentScreen = 0;
+     currentScreen = _dx11.getScreen();
+ 
+     static vector<string> screens = _dx11.listScreens();
+@@ -83,6 +89,48 @@
+         _dx11.setCaptureMethod((DX11::CaptureMethod)currentCaptureMethod);
+     }
+ 
++    } // !linuxMode (monitor / adapter / capture method)
++
++    if (linuxMode) {
++        // =========================================================
++        // Screen capture (Linux): the screen itself is chosen in the share dialog when you press Host.
++        // =========================================================
++        std::vector<std::pair<std::string, std::string>> captureModes = {
++            { "0", "Automatic (recommended)" },
++            { "1", "GPU, zero-copy" },
++            { "2", "GPU download" },
++            { "3", "Compatibility (compositor readback)" },
++        };
++        string modeCallback = to_string(Config::cfg.video.linuxCapture);
++        if (elSelect("Screen Capture", captureModes, modeCallback,
++            "How frames are received from your desktop. Automatic uses GPU zero-copy when it works and falls back to lighter-to-heavier methods. "
++            "GPU zero-copy never copies frames through system memory. GPU download lets the GPU hand over each frame. "
++            "Compatibility asks the desktop to read every frame back to the CPU (heaviest). Applies the next time you press Host.")) {
++            Config::cfg.video.linuxCapture = stoul(modeCallback);
++            SsbBridge::setCaptureOptions(Config::cfg.video.linuxCapture, Config::cfg.video.linuxSource, Config::cfg.video.rememberScreen);
++            Config::cfg.Save();
++        }
++
++        std::vector<std::pair<std::string, std::string>> sources = {
++            { "1", "Screen" }, { "2", "Single window" }, { "3", "Screen or window" },
++        };
++        string sourceCallback = to_string(Config::cfg.video.linuxSource);
++        if (elSelect("Share", sources, sourceCallback,
++            "What the share dialog offers when you press Host. A single window (for example just your emulator) is lighter than a whole screen. Applies the next time you press Host.")) {
++            Config::cfg.video.linuxSource = stoul(sourceCallback);
++            SsbBridge::setCaptureOptions(Config::cfg.video.linuxCapture, Config::cfg.video.linuxSource, Config::cfg.video.rememberScreen);
++            Config::cfg.Save();
++        }
++
++        bool remember = Config::cfg.video.rememberScreen;
++        if (elCheckbox("Remember my screen choice", remember,
++            "Skip the share dialog on later Host presses and reuse the screen or window you picked last time.")) {
++            Config::cfg.video.rememberScreen = remember;
++            SsbBridge::setCaptureOptions(Config::cfg.video.linuxCapture, Config::cfg.video.linuxSource, Config::cfg.video.rememberScreen);
++            Config::cfg.Save();
++        }
++    }
++
+     // =========================================================
+     // Resolution
+     // =========================================================
+@@ -103,10 +151,12 @@
+         int width = Config::cfg.resolutions[currentResolutionIndex].width;
+         int height = Config::cfg.resolutions[currentResolutionIndex].height;
+         _dx11.setTargetResolution(width, height);
++        if (linuxMode) SsbBridge::setWantedResolution(currentResolutionIndex > 0 ? width : 0, currentResolutionIndex > 0 ? height : 0);
+         
+         Config::cfg.Save();
+     }
+ 
++    if (!linuxMode) {
+     // =========================================================
+     // Lanczos Filter
+     // =========================================================
+@@ -129,6 +179,7 @@
+         Config::cfg.Save();
+     }
+     TooltipWidget::render("Sends video frames at regular intervals (according to FPS). Reduces stutter for the client when enabled. Disable for legacy behavior (loop runs as fast as possible).");
++    } // !linuxMode (lanczos / frame rhythm)
+     // =========================================================
+     // Bandwidth
+     // =========================================================
+@@ -149,7 +200,9 @@
+         TitleTooltipWidget::render("Encoder Bandwidth", "Limits the encoder bandwidth usage.\n(This value is split between guests.)");
+     }
+     ImGui::EndGroup();*/
+-	if (elNumber("Bandwidth (Mbps)", _bandwidth, 1, 1000, "Limits the encoder bandwidth usage.\n(This value is split between guests.")) {
++	if (elNumber("Bandwidth (Mbps)", _bandwidth, 1, 1000, SsbBridge::linuxMode()
++		? "Upload budget for the whole room. Parsec sends a separate copy of the stream to every guest, so it is divided between them: 30 here with 3 guests means about 10 Mbps each. Lower = softer picture but steadier and lower latency; it never exceeds this in total, however many guests join."
++		: "Limits the encoder bandwidth usage.\n(This value is split between guests.)")) {
+ 		TitleTooltipWidget::render("Encoder Bandwidth", "Limits the encoder bandwidth usage.\n(This value is split between guests.)");
+ 	}
+ 
+@@ -168,7 +221,15 @@
+     AppStyle::pop();
+     ImGui::End();
+     AppStyle::pop();*/
+-	if (elNumber("FPS", _fps, 10, 250, "Limits the amount of frames per second.")) {
++	if (linuxMode) {
++		// Parsec's host never streams more than 60 fps (checked: it ignores higher requests), so this can only
++		// be lowered - useful for guests on weak connections or devices.
++		if (_fps > 60) _fps = 60;
++		if (elNumber("FPS", _fps, 10, 60, "Maximum frames per second. Parsec limits hosted streams to 60 fps; lower it for guests on weak devices or connections. Frames are only sent when the screen changes.")) {
++			TitleTooltipWidget::render("Encoder FPS", "Limits the amount of frames per second.");
++		}
++	}
++	else if (elNumber("FPS", _fps, 10, 250, "Limits the amount of frames per second.")) {
+ 		TitleTooltipWidget::render("Encoder FPS", "Limits the amount of frames per second.");
+     }
+ 
+diff -ruN a/SmashSoda/XInputReader.cpp b/SmashSoda/XInputReader.cpp
+--- a/SmashSoda/XInputReader.cpp	2026-10-14 06:21:28.090165368 -0400
++++ b/SmashSoda/XInputReader.cpp	2026-10-14 06:30:22.800321224 -0400
+@@ -1,4 +1,5 @@
+-﻿#include "XInputReader.h"
++﻿#ifndef SSB_LINUX
++#include "XInputReader.h"
+ 
+ void XInputReader::init()
+ {
+@@ -117,6 +118,4 @@
+ {
+ 	Bitwise::setValue(&padState.state.Gamepad.wButtons, bit, isButtonPressed(reading, button));
+ }
+-
+-
+-
++#endif // SSB_LINUX
+diff -ruN a/SmashSoda/XInputReader.h b/SmashSoda/XInputReader.h
+--- a/SmashSoda/XInputReader.h	2026-10-14 06:21:28.090165368 -0400
++++ b/SmashSoda/XInputReader.h	2026-10-14 06:30:22.800420008 -0400
+@@ -1,5 +1,20 @@
+ ﻿#pragma once
+ 
++#ifdef SSB_LINUX
++// Windows.Gaming.Input (WinRT) is unavailable under Wine; host pads come through SDL instead.
++#include <vector>
++#include "GamepadState.h"
++
++class XInputReader
++{
++public:
++	void init() {}
++	std::vector<GamepadState>& readInputs() { return _gamepadReadings; }
++private:
++	std::vector<GamepadState> _gamepadReadings;
++};
++#else
++
+ #include <assert.h>
+ #include <mutex>
+ #include <roapi.h>
+@@ -38,7 +53,4 @@
+ 
+ 	vector<GamepadState> _gamepadReadings;
+ };
+-
+-
+-
+-
++#endif // SSB_LINUX

@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Smash Soda for Linux: starts the native bridge helpers (virtual gamepads,
+# input injection, screen + audio capture) and runs the Windows build under Proton.
+#
+#   smashsoda            run
+#   smashsoda --reset    forget a remembered screen-share choice (see SSB_REMEMBER_SCREEN)
+#
+# Environment: SMASHSODA_APP, SMASHSODA_PREFIX, PROTONPATH, SSB_MAX_HEIGHT, SSB_FPS (capture rate cap, default: your display's refresh rate), SSB_REMEMBER_SCREEN=1
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/smashsoda-linux"
+APP="${SMASHSODA_APP:-$DATA/app}"
+PFX="${SMASHSODA_PREFIX:-$DATA/pfx}"
+BRIDGE="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}/smashsoda"
+
+if [[ "${1:-}" == "--reset" ]]; then
+	rm -f "$DATA/portal-token"; echo "screen-share choice forgotten"; exit 0
+fi
+
+[[ -f "$APP/SmashSoda.exe" ]] || { echo "SmashSoda.exe not found in $APP (run ./setup.sh)" >&2; exit 1; }
+[[ -w /dev/uinput ]] || echo "warning: /dev/uinput is not writable - virtual gamepads and input injection will not work" >&2
+
+find_proton() {
+	[[ -n "${PROTONPATH:-}" ]] && { echo "$PROTONPATH"; return; }
+	local found
+	found="$(ls -d "$HOME"/.local/share/Steam/compatibilitytools.d/GE-Proton* "$HOME"/.steam/root/compatibilitytools.d/GE-Proton* \
+		"$HOME"/.local/share/umu/compatibilitytools/GE-Proton* 2>/dev/null | sort -V | tail -1)"
+	# Nothing installed: umu downloads the newest GE-Proton on first run.
+	echo "${found:-GE-Proton}"
+}
+PROTON="$(find_proton)"
+[[ -n "$PROTON" ]] || { echo "No GE-Proton found; set PROTONPATH" >&2; exit 1; }
+command -v umu-run >/dev/null || { echo "umu-run (umu-launcher) is not installed - see the README" >&2; exit 1; }
+
+mkdir -p "$BRIDGE" "$PFX" "$DATA"
+: > "$BRIDGE/smashsoda-wine.log"
+: > "$BRIDGE/helpers.log"
+: > "$BRIDGE/parsec.log"
+PIDS=()
+cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
+trap cleanup EXIT INT TERM
+
+"$ROOT/bridge/ssb-padd" "$BRIDGE" & PIDS+=($!)
+# Per-app audio mixer (lists apps that make sound; volume / mute / share-with-guests). Restores routing on exit.
+python3 "$ROOT/bridge/ssb-audioapps.py" "$BRIDGE" & PIDS+=($!)
+# Can this Proton build open CUDA buffers exported by a native Linux process? That makes frames travel
+# GPU-to-GPU with no system-memory copies. Probed once per Proton build and remembered.
+probe_gpu_ipc() {
+	local key; key="$(basename "$PROTON")"
+	local cache="$DATA/gpu-ipc-$key"
+	if [[ -f "$cache" ]]; then cat "$cache"; return; fi
+	[[ -f "$ROOT/bridge/ipc_probe.exe" && -x "$(command -v python3)" ]] || { echo 0; return; }
+	local out="$BRIDGE/ipc-probe.out"; rm -f "$out" "$BRIDGE/ipc.bin"
+	python3 "$ROOT/bridge/ipc_probe_native.py" "$BRIDGE/ipc.bin" 30 >/dev/null 2>&1 & local npid=$!
+	for _ in $(seq 1 30); do [[ -f "$BRIDGE/ipc.bin" ]] && break; sleep 0.2; done
+	( cd "$ROOT/bridge" && PRESSURE_VESSEL_FILESYSTEMS_RW="$BRIDGE" WINEPREFIX="$PFX" PROTONPATH="$PROTON" GAMEID="${GAMEID:-umu-smashsoda}" \
+		PROTON_ENABLE_NVAPI=1 PROTON_NVIDIA_NVENC=1 SSB_BRIDGE_DIR="$BRIDGE" timeout 60 umu-run "$ROOT/bridge/ipc_probe.exe" "Z:${BRIDGE//\//\\}\\ipc-probe.out" >/dev/null 2>&1 )
+	kill "$npid" 2>/dev/null; wait "$npid" 2>/dev/null
+	# Only a probe that actually ran is remembered (e.g. it cannot run while another instance holds the prefix).
+	[[ -f "$out" ]] || { echo 0; return; }
+	local result=0
+	grep -q "IPC_OK" "$out" 2>/dev/null && result=1
+	echo "$result" | tee "$cache"
+}
+
+# The capture helper stays idle until you press Host. It runs in an "app-smashsoda" systemd scope so the
+# screen-share dialog names Smash Soda (via smashsoda.desktop) instead of a Python process.
+CAP_ARGS=(--dir "$BRIDGE" --token "$DATA/portal-token")
+[[ -n "${SSB_FPS:-}" ]] && CAP_ARGS+=(--fps "$SSB_FPS")                # default: the display refresh rate
+[[ -n "${SSB_MAX_HEIGHT:-}" ]] && CAP_ARGS+=(--max-height "$SSB_MAX_HEIGHT")
+[[ "${SSB_REMEMBER_SCREEN:-0}" == 1 ]] && CAP_ARGS+=(--remember)
+# SSB_CAPTURE=auto|gl|shm (default auto: GPU buffers, falling back to the compositor-readback path)
+# SSB_SOURCE=monitor|window|any (what the screen-share picker offers; window = capture just one app)
+if [[ -z "${SSB_GPU_IPC:-}" ]]; then SSB_GPU_IPC="$(probe_gpu_ipc)"; fi
+CAP_ARGS+=(--capture-mode "${SSB_CAPTURE:-auto}" --source "${SSB_SOURCE:-monitor}" --gpu-ipc "$SSB_GPU_IPC")
+if command -v systemd-run >/dev/null && systemd-run --user --scope --quiet --unit="app-ssb-smashsoda-probe$$.scope" true 2>/dev/null; then
+	systemd-run --user --scope --quiet --unit="app-ssb-smashsoda-$$.scope" python3 "$ROOT/bridge/ssb-capture.py" "${CAP_ARGS[@]}" & PIDS+=($!)
+else
+	python3 "$ROOT/bridge/ssb-capture.py" "${CAP_ARGS[@]}" & PIDS+=($!)
+fi
+
+# Give the helpers a moment to publish before the app looks for them.
+for _ in $(seq 1 100); do
+	[[ -f "$BRIDGE/video.shm" && -f "$BRIDGE/pads.shm" ]] && break
+	sleep 0.1
+done
+
+export PRESSURE_VESSEL_FILESYSTEMS_RW="$BRIDGE${PRESSURE_VESSEL_FILESYSTEMS_RW:+:$PRESSURE_VESSEL_FILESYSTEMS_RW}"
+export SSB_BRIDGE_DIR="$BRIDGE"
+export WINEPREFIX="$PFX" PROTONPATH="$PROTON" GAMEID="${GAMEID:-umu-smashsoda}"
+# Smash Soda runs on the GPU that is driving your display - the one that is actually active - by default.
+# Pinning it to another GPU is opt-in only: SSB_GPU="RTX 3050" smashsoda   (not recommended: a GPU that
+# is not driving the display is untested for performance and runs the UI/capture path across GPUs).
+if [[ -n "${SSB_GPU:-}" && "${SSB_GPU}" != off && -z "${DXVK_FILTER_DEVICE_NAME:-}" ]]; then
+	export DXVK_FILTER_DEVICE_NAME="${SSB_GPU}"
+	echo "smashsoda: pinned to GPU '$DXVK_FILTER_DEVICE_NAME' (SSB_GPU)" >&2
+fi
+
+# Hardware video encoding: expose the host NVIDIA encoder to Parsec through Proton.
+export PROTON_ENABLE_NVAPI=1 PROTON_NVIDIA_NVENC=1
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-}"
+
+cd "$APP"
+umu-run "$APP/SmashSoda.exe" "$@"

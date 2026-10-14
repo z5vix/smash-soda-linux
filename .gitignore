@@ -1,0 +1,7 @@
+build/
+.cache/
+bridge/ssb-padd
+bridge/*.exe
+*.dll
+*.exe
+__pycache__/
