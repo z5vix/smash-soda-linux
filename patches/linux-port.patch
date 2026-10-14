@@ -1,6 +1,6 @@
 diff -ruN a/SmashSoda/AudioSource.cpp b/SmashSoda/AudioSource.cpp
 --- a/SmashSoda/AudioSource.cpp	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/AudioSource.cpp	2026-10-14 16:43:12.334369843 -0400
++++ b/SmashSoda/AudioSource.cpp	2026-10-14 17:51:27.661357707 -0400
 @@ -1,4 +1,5 @@
  ﻿#include "AudioSource.h"
 +#include "AudioProcessLoopback.h"
@@ -152,7 +152,7 @@ diff -ruN a/SmashSoda/AudioSource.cpp b/SmashSoda/AudioSource.cpp
  	return m_devices;
 diff -ruN a/SmashSoda/AudioSource.h b/SmashSoda/AudioSource.h
 --- a/SmashSoda/AudioSource.h	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/AudioSource.h	2026-10-14 16:43:12.353801359 -0400
++++ b/SmashSoda/AudioSource.h	2026-10-14 17:51:27.661549061 -0400
 @@ -48,7 +48,12 @@
  class AudioSource
  {
@@ -176,7 +176,7 @@ diff -ruN a/SmashSoda/AudioSource.h b/SmashSoda/AudioSource.h
  };
 diff -ruN a/SmashSoda/core/Config.cpp b/SmashSoda/core/Config.cpp
 --- a/SmashSoda/core/Config.cpp	2026-10-14 06:21:28.092028713 -0400
-+++ b/SmashSoda/core/Config.cpp	2026-10-14 16:43:12.410851331 -0400
++++ b/SmashSoda/core/Config.cpp	2026-10-14 17:51:27.693371242 -0400
 @@ -102,6 +102,7 @@
  			cfg.audio.speakersVolume = setValue(cfg.audio.speakersVolume, j["Audio"]["speakersVolume"].get<float>());
  			cfg.audio.speakersEnabled = setValue(cfg.audio.speakersEnabled, j["Audio"]["speakersEnabled"].get<bool>());
@@ -217,7 +217,7 @@ diff -ruN a/SmashSoda/core/Config.cpp b/SmashSoda/core/Config.cpp
  		{"bandwidth", cfg.video.bandwidth}
 diff -ruN a/SmashSoda/core/Config.h b/SmashSoda/core/Config.h
 --- a/SmashSoda/core/Config.h	2026-10-14 06:21:28.092028713 -0400
-+++ b/SmashSoda/core/Config.h	2026-10-14 16:43:12.421571399 -0400
++++ b/SmashSoda/core/Config.h	2026-10-14 17:51:27.693593606 -0400
 @@ -49,6 +49,7 @@
  		float speakersVolume = 50;
  		bool speakersEnabled = true;
@@ -238,7 +238,7 @@ diff -ruN a/SmashSoda/core/Config.h b/SmashSoda/core/Config.h
  		unsigned int bandwidth = 20;
 diff -ruN a/SmashSoda/DX11.cpp b/SmashSoda/DX11.cpp
 --- a/SmashSoda/DX11.cpp	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/DX11.cpp	2026-10-14 16:43:12.354892043 -0400
++++ b/SmashSoda/DX11.cpp	2026-10-14 17:51:27.662205955 -0400
 @@ -1,4 +1,5 @@
  #include "DX11.h"
 +#include "linux/SsbBridge.h"
@@ -504,7 +504,7 @@ diff -ruN a/SmashSoda/DX11.cpp b/SmashSoda/DX11.cpp
  }
 diff -ruN a/SmashSoda/DX11.h b/SmashSoda/DX11.h
 --- a/SmashSoda/DX11.h	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/DX11.h	2026-10-14 16:43:12.364837215 -0400
++++ b/SmashSoda/DX11.h	2026-10-14 17:51:27.662361559 -0400
 @@ -5,7 +5,6 @@
  #include <dxgi1_2.h>
  #include <iostream>
@@ -552,7 +552,7 @@ diff -ruN a/SmashSoda/DX11.h b/SmashSoda/DX11.h
  	WGCapture _wgCapture;
 diff -ruN a/SmashSoda/helpers/PathHelper.cpp b/SmashSoda/helpers/PathHelper.cpp
 --- a/SmashSoda/helpers/PathHelper.cpp	2026-10-14 06:21:28.142797143 -0400
-+++ b/SmashSoda/helpers/PathHelper.cpp	2026-10-14 16:43:12.738828784 -0400
++++ b/SmashSoda/helpers/PathHelper.cpp	2026-10-14 17:51:28.021456673 -0400
 @@ -64,6 +64,7 @@
  
  		return dirPath;
@@ -563,7 +563,7 @@ diff -ruN a/SmashSoda/helpers/PathHelper.cpp b/SmashSoda/helpers/PathHelper.cpp
  std::string PathHelper::ConvertTCHARToString(const TCHAR* tcharStr) {
 diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
 --- a/SmashSoda/Hosting.cpp	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/Hosting.cpp	2026-10-14 16:43:12.366579685 -0400
++++ b/SmashSoda/Hosting.cpp	2026-10-14 17:51:27.663542528 -0400
 @@ -1,4 +1,8 @@
 +#include <set>
  #include "Hosting.h"
@@ -573,7 +573,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  #include "services/OverlayService.h"
  #include "services/InputControlService.h"
  #include "services/GuestStateStore.h"
-@@ -138,7 +142,28 @@
+@@ -138,7 +142,29 @@
   */
  void Hosting::init() {
  	
@@ -591,6 +591,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
 +		}
 +	}
 +	_parsecStatus = ParsecInit(parsecCfgPtr, NULL, (char *)SDK_PATH, &_parsec);
++	SsbBridge::patchParsecWinsock();   // Linux build: see the comment there (IPv4 packets are otherwise dropped under Wine)
 +	if (SsbBridge::linuxMode() && _parsec) {
 +		ParsecConfig actual = {};
 +		ParsecGetConfig(_parsec, &actual);
@@ -603,7 +604,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  	_dx11.init();
  	GuestStateStore::instance().load();
  	
-@@ -174,6 +199,12 @@
+@@ -174,6 +200,12 @@
  	audioIn.setDevice(Config::cfg.audio.inputDevice);
  	audioIn.captureAudio();
  	audioIn.volume = Config::cfg.audio.micVolume;
@@ -616,7 +617,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  	_parsecSession.loadSessionCache();
  
  	fetchAccountData();
-@@ -207,6 +238,20 @@
+@@ -207,6 +239,20 @@
   */
  void Hosting::LogCallback(ParsecLogLevel level, const char *msg, void *opaque) {
  	Hosting* self = static_cast<Hosting*>(opaque);
@@ -637,7 +638,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  	if (Config::cfg.general.parsecLogs) {
  		self->logMessage(msg);
  	}
-@@ -457,7 +502,11 @@
+@@ -457,7 +503,11 @@
  			return guest;
  		}
  	}
@@ -650,7 +651,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  }
  
  /**
-@@ -626,6 +675,7 @@
+@@ -626,6 +676,7 @@
  	_hostConfig.video->encoderMaxBitrate = bandwidth;
  	Config::cfg.video.fps = fps;
  	Config::cfg.video.bandwidth = bandwidth;
@@ -658,7 +659,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  }
  
  /**
-@@ -720,6 +770,7 @@
+@@ -720,6 +771,7 @@
  	}
  
  	_isRunning = false;
@@ -666,7 +667,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  	GuestList::instance.clear();
  
  	// Stop hotseat mode
-@@ -899,6 +950,7 @@
+@@ -899,6 +951,7 @@
  	const uint32_t SAFE_FREQUENCY = 48000;
  	const size_t SUBMIT_CHUNK_FRAMES = static_cast<size_t>(SAFE_FREQUENCY / 100); // 10ms
  	const size_t SUBMIT_CHUNK_SAMPLES = SUBMIT_CHUNK_FRAMES * 2; // stereo interleaved
@@ -674,7 +675,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  	const size_t MAX_PENDING_SAMPLES = SUBMIT_CHUNK_SAMPLES * 24; // ~240ms queue headroom
  
  	std::deque<int16_t> pendingIn;
-@@ -957,6 +1009,63 @@
+@@ -957,6 +1010,63 @@
  		}
  	};
  
@@ -738,7 +739,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  	while (_isRunning)
  	{
  		const bool usePacing = Config::cfg.video.framePacing;
-@@ -977,7 +1086,10 @@
+@@ -977,7 +1087,10 @@
  
  		_dx11.captureScreen(_parsec);
  
@@ -750,7 +751,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  			audioIn.captureAudio();
  			drainSource(audioIn, pendingIn);
  		}
-@@ -985,7 +1097,7 @@
+@@ -985,7 +1098,7 @@
  			pendingIn.clear();
  		}
  
@@ -759,7 +760,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  			audioOut.captureAudio();
  			drainSource(audioOut, pendingOut);
  		}
-@@ -993,71 +1105,75 @@
+@@ -993,71 +1106,75 @@
  			pendingOut.clear();
  		}
  
@@ -885,7 +886,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  			auto elapsed = std::chrono::steady_clock::now() - frameStart;
  			double elapsedSec = std::chrono::duration<double>(elapsed).count();
  			double remainingSec = frameIntervalSec - elapsedSec;
-@@ -1070,6 +1186,9 @@
+@@ -1070,6 +1187,9 @@
  		}
  	}
  
@@ -895,7 +896,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  #ifdef _WIN32
  	timeEndPeriod(1);
  #endif
-@@ -1095,6 +1214,7 @@
+@@ -1095,6 +1215,7 @@
  	_eventMutex.lock();
  
  	ParsecHostStop(_parsec);
@@ -903,7 +904,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  	_isRunning = false;
  
  	_mediaMutex.unlock();
-@@ -1127,6 +1247,7 @@
+@@ -1127,6 +1248,7 @@
  			Guest guest = Guest(parsecGuest.name, parsecGuest.userID, parsecGuest.id);
  			guestCount = ParsecHostGetGuests(_parsec, GUEST_CONNECTED, &guests);
  			GuestList::instance.setGuests(guests, guestCount);
@@ -911,7 +912,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  			//logMessage("event: " + to_string(event.type) + " guest: " + guest.name + " state: " + to_string(state) + " status: " + to_string(event.guestStateChange.status));
  
  			switch (event.type)
-@@ -1207,6 +1328,29 @@
+@@ -1207,6 +1329,29 @@
  }
  
  /**
@@ -941,7 +942,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
   * Polls Smash Soda specific functionality.
   */
  void Hosting::pollSmashSoda() {
-@@ -1216,6 +1360,13 @@
+@@ -1216,6 +1361,13 @@
  
  		Sleep(100);
  
@@ -955,7 +956,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  		// Handles all the automatic button press stuff
  		_macro.run();
  
-@@ -1360,6 +1511,25 @@
+@@ -1360,6 +1512,25 @@
  	{
  		if (ParsecHostPollInput(_parsec, 4, &inputGuest, &inputGuestMsg))
  		{
@@ -981,7 +982,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  			Guest guest;
  			bool hasGuest = GuestList::instance.find(inputGuest.userID, &guest);
  			bool allowKeyboard = inputGuest.perms.keyboard;
-@@ -1370,6 +1540,29 @@
+@@ -1370,6 +1541,29 @@
  				allowMouse = guest.allowMouseInput;
  			}
  
@@ -1011,7 +1012,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  			if ((inputGuestMsg.type == MESSAGE_MOUSE_BUTTON ||
  				inputGuestMsg.type == MESSAGE_MOUSE_WHEEL ||
  				inputGuestMsg.type == MESSAGE_MOUSE_MOTION) &&
-@@ -1412,6 +1605,16 @@
+@@ -1412,6 +1606,16 @@
  bool Hosting::roomStart() {
  	
  	if (isReady()) {
@@ -1028,7 +1029,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  		ParsecStatus status = ParsecHostStart(_parsec, HOST_DESKTOP, &_hostConfig, _parsecSession.sessionId.c_str());
  		Sleep(2000);
  		ParsecHostStop(_parsec);
-@@ -1652,6 +1855,7 @@
+@@ -1652,6 +1856,7 @@
   * @param status The status of the state change.
   */
  void Hosting::onGuestStateChange(ParsecGuestState& state, Guest& guest, ParsecStatus& status) {
@@ -1038,7 +1039,7 @@ diff -ruN a/SmashSoda/Hosting.cpp b/SmashSoda/Hosting.cpp
  			handleGuestIpAddress(guest);
 diff -ruN a/SmashSoda/Hosting.h b/SmashSoda/Hosting.h
 --- a/SmashSoda/Hosting.h	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/Hosting.h	2026-10-14 16:43:12.366907707 -0400
++++ b/SmashSoda/Hosting.h	2026-10-14 17:51:27.663730305 -0400
 @@ -147,6 +147,7 @@
  	void pollInputs();
  	void pollLatency();
@@ -1057,7 +1058,7 @@ diff -ruN a/SmashSoda/Hosting.h b/SmashSoda/Hosting.h
  	bool _showWelcome = false;
 diff -ruN a/SmashSoda/Main.cpp b/SmashSoda/Main.cpp
 --- a/SmashSoda/Main.cpp	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/Main.cpp	2026-10-14 16:43:12.376710490 -0400
++++ b/SmashSoda/Main.cpp	2026-10-14 17:51:27.664473688 -0400
 @@ -1,4 +1,5 @@
 -﻿// Dear ImGui: standalone example application for DirectX 11
 +﻿#include "linux/SsbBridge.h"
@@ -1139,7 +1140,7 @@ diff -ruN a/SmashSoda/Main.cpp b/SmashSoda/Main.cpp
      // Cleanup
 diff -ruN a/SmashSoda/pch.h b/SmashSoda/pch.h
 --- a/SmashSoda/pch.h	2026-10-14 06:21:28.153101524 -0400
-+++ b/SmashSoda/pch.h	2026-10-14 16:43:12.975917746 -0400
++++ b/SmashSoda/pch.h	2026-10-14 17:51:28.192068380 -0400
 @@ -1,5 +1,9 @@
  #pragma once
  
@@ -1152,7 +1153,7 @@ diff -ruN a/SmashSoda/pch.h b/SmashSoda/pch.h
  #include <string>
 diff -ruN a/SmashSoda/services/Arcade.cpp b/SmashSoda/services/Arcade.cpp
 --- a/SmashSoda/services/Arcade.cpp	2026-10-14 06:21:28.153101524 -0400
-+++ b/SmashSoda/services/Arcade.cpp	2026-10-14 16:43:12.976312018 -0400
++++ b/SmashSoda/services/Arcade.cpp	2026-10-14 17:51:28.192423584 -0400
 @@ -45,6 +45,7 @@
  		}
  	}
@@ -1163,7 +1164,7 @@ diff -ruN a/SmashSoda/services/Arcade.cpp b/SmashSoda/services/Arcade.cpp
  /**
 diff -ruN a/SmashSoda/services/InputControlService.cpp b/SmashSoda/services/InputControlService.cpp
 --- a/SmashSoda/services/InputControlService.cpp	2026-10-14 06:21:28.153296807 -0400
-+++ b/SmashSoda/services/InputControlService.cpp	2026-10-14 16:43:12.978829093 -0400
++++ b/SmashSoda/services/InputControlService.cpp	2026-10-14 17:51:28.217109614 -0400
 @@ -1,5 +1,6 @@
  #include "InputControlService.h"
  #include "../core/Config.h"
@@ -1218,7 +1219,7 @@ diff -ruN a/SmashSoda/services/InputControlService.cpp b/SmashSoda/services/Inpu
          input.type = INPUT_MOUSE;
 diff -ruN a/SmashSoda/SmashSoda.vcxproj b/SmashSoda/SmashSoda.vcxproj
 --- a/SmashSoda/SmashSoda.vcxproj	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/SmashSoda.vcxproj	2026-10-14 16:43:12.378152121 -0400
++++ b/SmashSoda/SmashSoda.vcxproj	2026-10-14 17:51:27.665551115 -0400
 @@ -254,6 +254,7 @@
      <ClCompile Include="AudioIn.cpp" />
      <ClCompile Include="AudioMix.cpp" />
@@ -1237,7 +1238,7 @@ diff -ruN a/SmashSoda/SmashSoda.vcxproj b/SmashSoda/SmashSoda.vcxproj
      <ClInclude Include="Chatbot\Commands\God\CommandPublic.h" />
 diff -ruN a/SmashSoda/SmashSoda.vcxproj.filters b/SmashSoda/SmashSoda.vcxproj.filters
 --- a/SmashSoda/SmashSoda.vcxproj.filters	2026-10-14 06:21:28.089508905 -0400
-+++ b/SmashSoda/SmashSoda.vcxproj.filters	2026-10-14 16:43:12.378657159 -0400
++++ b/SmashSoda/SmashSoda.vcxproj.filters	2026-10-14 17:51:27.666013268 -0400
 @@ -24,6 +24,9 @@
      <ClCompile Include="AudioOut.cpp">
        <Filter>Source Files</Filter>
@@ -1260,7 +1261,7 @@ diff -ruN a/SmashSoda/SmashSoda.vcxproj.filters b/SmashSoda/SmashSoda.vcxproj.fi
      </ClInclude>
 diff -ruN a/SmashSoda/WGCapture.cpp b/SmashSoda/WGCapture.cpp
 --- a/SmashSoda/WGCapture.cpp	2026-10-14 06:21:28.090165368 -0400
-+++ b/SmashSoda/WGCapture.cpp	2026-10-14 16:43:12.390741388 -0400
++++ b/SmashSoda/WGCapture.cpp	2026-10-14 17:51:27.673317858 -0400
 @@ -1,3 +1,17 @@
 +#ifdef SSB_LINUX
 +// Windows Graphics Capture needs WinRT; under Wine the Linux bridge supplies frames instead.
@@ -1286,7 +1287,7 @@ diff -ruN a/SmashSoda/WGCapture.cpp b/SmashSoda/WGCapture.cpp
 +#endif // SSB_LINUX
 diff -ruN a/SmashSoda/widgets/AudioSettingsWidget.cpp b/SmashSoda/widgets/AudioSettingsWidget.cpp
 --- a/SmashSoda/widgets/AudioSettingsWidget.cpp	2026-10-14 06:21:28.155308428 -0400
-+++ b/SmashSoda/widgets/AudioSettingsWidget.cpp	2026-10-14 16:43:13.084271976 -0400
++++ b/SmashSoda/widgets/AudioSettingsWidget.cpp	2026-10-14 17:51:28.244142161 -0400
 @@ -1,4 +1,5 @@
  #include "AudioSettingsWidget.h"
 +#include "../linux/SsbBridge.h"
@@ -1462,7 +1463,7 @@ diff -ruN a/SmashSoda/widgets/AudioSettingsWidget.cpp b/SmashSoda/widgets/AudioS
      if (showPlot) {
 diff -ruN a/SmashSoda/widgets/AudioSettingsWidget.h b/SmashSoda/widgets/AudioSettingsWidget.h
 --- a/SmashSoda/widgets/AudioSettingsWidget.h	2026-10-14 06:21:28.155308428 -0400
-+++ b/SmashSoda/widgets/AudioSettingsWidget.h	2026-10-14 16:43:13.084462819 -0400
++++ b/SmashSoda/widgets/AudioSettingsWidget.h	2026-10-14 17:51:28.244315731 -0400
 @@ -4,6 +4,7 @@
  #include "../imgui/implot.h"
  #include "../Hosting.h"
@@ -1473,7 +1474,7 @@ diff -ruN a/SmashSoda/widgets/AudioSettingsWidget.h b/SmashSoda/widgets/AudioSet
  #include "ToggleIconButtonWidget.h"
 diff -ruN a/SmashSoda/widgets/HostSettingsWidget.cpp b/SmashSoda/widgets/HostSettingsWidget.cpp
 --- a/SmashSoda/widgets/HostSettingsWidget.cpp	2026-10-14 06:21:28.155308428 -0400
-+++ b/SmashSoda/widgets/HostSettingsWidget.cpp	2026-10-14 16:43:13.128366094 -0400
++++ b/SmashSoda/widgets/HostSettingsWidget.cpp	2026-10-14 17:51:28.246547754 -0400
 @@ -1,4 +1,5 @@
  #include "HostSettingsWidget.h"
 +#include "../linux/SsbBridge.h"
@@ -1518,7 +1519,7 @@ diff -ruN a/SmashSoda/widgets/HostSettingsWidget.cpp b/SmashSoda/widgets/HostSet
              _popupTitle = "Stop Hosting";
 diff -ruN a/SmashSoda/widgets/TitleTooltipWidget.cpp b/SmashSoda/widgets/TitleTooltipWidget.cpp
 --- a/SmashSoda/widgets/TitleTooltipWidget.cpp	2026-10-14 06:21:28.156170681 -0400
-+++ b/SmashSoda/widgets/TitleTooltipWidget.cpp	2026-10-14 16:43:13.181402481 -0400
++++ b/SmashSoda/widgets/TitleTooltipWidget.cpp	2026-10-14 17:51:28.249613187 -0400
 @@ -28,6 +28,7 @@
  
  		return true;
@@ -1529,7 +1530,7 @@ diff -ruN a/SmashSoda/widgets/TitleTooltipWidget.cpp b/SmashSoda/widgets/TitleTo
  
 diff -ruN a/SmashSoda/widgets/TooltipWidget.cpp b/SmashSoda/widgets/TooltipWidget.cpp
 --- a/SmashSoda/widgets/TooltipWidget.cpp	2026-10-14 06:21:28.156170681 -0400
-+++ b/SmashSoda/widgets/TooltipWidget.cpp	2026-10-14 16:43:13.181741595 -0400
++++ b/SmashSoda/widgets/TooltipWidget.cpp	2026-10-14 17:51:28.249873746 -0400
 @@ -10,6 +10,7 @@
  		ImGui::SetTooltip(text);
  		return true;
@@ -1540,7 +1541,7 @@ diff -ruN a/SmashSoda/widgets/TooltipWidget.cpp b/SmashSoda/widgets/TooltipWidge
  
 diff -ruN a/SmashSoda/widgets/VideoWidget.cpp b/SmashSoda/widgets/VideoWidget.cpp
 --- a/SmashSoda/widgets/VideoWidget.cpp	2026-10-14 06:21:28.156170681 -0400
-+++ b/SmashSoda/widgets/VideoWidget.cpp	2026-10-14 16:43:13.199278353 -0400
++++ b/SmashSoda/widgets/VideoWidget.cpp	2026-10-14 17:51:28.250417199 -0400
 @@ -1,4 +1,5 @@
  #include "VideoWidget.h"
 +#include "../linux/SsbBridge.h"
@@ -1664,7 +1665,7 @@ diff -ruN a/SmashSoda/widgets/VideoWidget.cpp b/SmashSoda/widgets/VideoWidget.cp
  
 diff -ruN a/SmashSoda/XInputReader.cpp b/SmashSoda/XInputReader.cpp
 --- a/SmashSoda/XInputReader.cpp	2026-10-14 06:21:28.090165368 -0400
-+++ b/SmashSoda/XInputReader.cpp	2026-10-14 16:43:12.401715333 -0400
++++ b/SmashSoda/XInputReader.cpp	2026-10-14 17:51:27.684320758 -0400
 @@ -1,4 +1,5 @@
 -﻿#include "XInputReader.h"
 +﻿#ifndef SSB_LINUX
@@ -1682,7 +1683,7 @@ diff -ruN a/SmashSoda/XInputReader.cpp b/SmashSoda/XInputReader.cpp
 +#endif // SSB_LINUX
 diff -ruN a/SmashSoda/XInputReader.h b/SmashSoda/XInputReader.h
 --- a/SmashSoda/XInputReader.h	2026-10-14 06:21:28.090165368 -0400
-+++ b/SmashSoda/XInputReader.h	2026-10-14 16:43:12.401908050 -0400
++++ b/SmashSoda/XInputReader.h	2026-10-14 17:51:27.684477294 -0400
 @@ -1,5 +1,20 @@
  ﻿#pragma once
  

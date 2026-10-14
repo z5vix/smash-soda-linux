@@ -55,6 +55,12 @@ namespace SsbBridge {
 	void setBitrateBudget(unsigned kbps);
 	void setGuestCount(unsigned guests);
 
+	// Works around a Wine behaviour that makes IPv4 unusable for Parsec: on a dual-stack UDP socket Wine attaches two packet-info
+	// control messages (IPv6 + IPv4) to every IPv4 datagram, Parsec's receive buffer only fits one, and the datagram is dropped -
+	// so STUN replies and every IPv4 peer packet are lost and the host never publishes its public address.
+	// Call once after parsec.dll is loaded: Parsec's request for IP_PKTINFO on its IPv6 socket is ignored (the IPv6 one is enough).
+	void patchParsecWinsock();
+
 	// Logs the exception code and where it happened (module + offset, with a short stack) if the app crashes.
 	void installCrashLogger();
 

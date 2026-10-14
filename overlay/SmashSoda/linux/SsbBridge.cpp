@@ -1,3 +1,5 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "SsbBridge.h"
 
 #include <string>
@@ -267,6 +269,59 @@ namespace SsbBridge {
 	void installCrashLogger()
 	{
 		SetUnhandledExceptionFilter(crashFilter);
+	}
+
+	// ---------------------------------------------------------------------------------------------- Winsock workaround
+	typedef int (WSAAPI* PFN_setsockopt)(SOCKET, int, int, const char*, int);
+	static PFN_setsockopt g_realSetsockopt = nullptr;
+
+	static int WSAAPI hookedSetsockopt(SOCKET s, int level, int optname, const char* optval, int optlen)
+	{
+		if (level == IPPROTO_IP && optname == IP_PKTINFO) {
+			WSAPROTOCOL_INFOW pi = {}; int len = sizeof pi;
+			const bool v6 = getsockopt(s, SOL_SOCKET, SO_PROTOCOL_INFOW, (char*)&pi, &len) != 0 || pi.iAddressFamily == AF_INET6;
+			if (v6) {
+				static bool logged = false;
+				if (!logged) { logged = true; log("parsec: ignoring IP_PKTINFO on the dual-stack socket (Wine would add a second control message that does not fit)"); }
+				return 0;
+			}
+		}
+		return g_realSetsockopt(s, level, optname, optval, optlen);
+	}
+
+	void patchParsecWinsock()
+	{
+		if (!linuxMode() || tuningInt("fix_pktinfo", 1) == 0) return;
+		HMODULE mod = GetModuleHandleA("parsec.dll");
+		HMODULE ws2 = GetModuleHandleA("ws2_32.dll");
+		if (!mod || !ws2) { log("parsec: winsock patch skipped (parsec.dll or ws2_32 not loaded)"); return; }
+		g_realSetsockopt = (PFN_setsockopt)GetProcAddress(ws2, "setsockopt");
+		if (!g_realSetsockopt) return;
+
+		BYTE* base = (BYTE*)mod;
+		auto* dos = (IMAGE_DOS_HEADER*)base;
+		auto* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+		const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if (!dir.VirtualAddress) return;
+		int patched = 0;
+		for (auto* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; imp++) {
+			if (_stricmp((const char*)(base + imp->Name), "WS2_32.dll") != 0) continue;
+			auto* thunk = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
+			auto* orig = (IMAGE_THUNK_DATA*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+			for (; orig->u1.AddressOfData; orig++, thunk++) {
+				bool match;
+				if (IMAGE_SNAP_BY_ORDINAL(orig->u1.Ordinal)) match = IMAGE_ORDINAL(orig->u1.Ordinal) == 21;   // WS2_32 ordinal 21 = setsockopt
+				else match = strcmp((const char*)((IMAGE_IMPORT_BY_NAME*)(base + orig->u1.AddressOfData))->Name, "setsockopt") == 0;
+				if (!match) continue;
+				DWORD old = 0;
+				if (VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
+					thunk->u1.Function = (ULONG_PTR)&hookedSetsockopt;
+					VirtualProtect(&thunk->u1.Function, sizeof(void*), old, &old);
+					patched++;
+				}
+			}
+		}
+		log("parsec: winsock workaround for IPv4 packets %s (%d import patched)", patched ? "installed" : "NOT installed", patched);
 	}
 
 	void setCaptureOptions(unsigned captureMode, unsigned sourceTypes, bool remember)

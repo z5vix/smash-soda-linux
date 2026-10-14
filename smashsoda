@@ -105,4 +105,11 @@ export PROTON_ENABLE_NVAPI=1 PROTON_NVIDIA_NVENC=1
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-}"
 
 cd "$APP"
-umu-run "$APP/SmashSoda.exe" "$@"
+# Debugging: SSB_WINEDEBUG="+winsock,+timestamp" smashsoda   writes Wine's network-call trace to $BRIDGE/wine-debug.log
+if [[ -n "${SSB_WINEDEBUG:-}" ]]; then
+	export WINEDEBUG="$SSB_WINEDEBUG"
+	echo "smashsoda: Wine trace ($WINEDEBUG) -> $BRIDGE/wine-debug.log" >&2
+	umu-run "$APP/SmashSoda.exe" "$@" > "$BRIDGE/wine-debug.log" 2>&1
+else
+	umu-run "$APP/SmashSoda.exe" "$@"
+fi

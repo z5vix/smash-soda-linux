@@ -80,11 +80,13 @@ Environment overrides: `SSB_CAPTURE` (auto|gl|shm), `SSB_SOURCE` (monitor|window
 Logs are in `$XDG_RUNTIME_DIR/smashsoda/`: `smashsoda-wine.log` (the app, including `CRASH:` lines with the exception and module+offset if it crashes),
 `helpers.log` (capture/audio/gamepad helpers), `parsec.log` (Parsec's own log, IPs masked).
 
-* Guest sees "peer-to-peer connection failed [-6023 / -11004]" (host log: `-6024`): Parsec could not hole-punch between you and them. Check that
-  `smashsoda-wine.log` shows `parsec: hosting port ...`. This is typical when the guest is on a mobile network or 5G home internet (carrier-grade NAT).
-  Fix it from your side by pinning Parsec's UDP port and forwarding it on your router (the guest then only needs to reach you, no hole punching):
-  `echo 8000 > ~/.local/share/smashsoda-linux/host-port` (or `SSB_HOST_PORT=8000 smashsoda`), then forward UDP 8000 to this PC in the router settings.
-  UPnP is enabled by default, so on many routers this happens automatically; the port Parsec really uses is logged at start.
+* Guest sees "peer-to-peer connection failed [-6023 / -11004]" (host log: `-6024`): Parsec could not publish or reach your public address.
+  Make sure `smashsoda-wine.log` contains `parsec: winsock workaround for IPv4 packets installed` - without it Wine drops every IPv4 packet Parsec
+  reads (it attaches two control messages where Parsec's buffer fits one), the host never learns its public address and only LAN/IPv6 guests can join.
+  If it still fails for a guest on a strict mobile/5G carrier network, you can pin Parsec's UDP port and forward it on your router (normally not needed):
+  `echo 8000 > ~/.local/share/smashsoda-linux/host-port` (or `SSB_HOST_PORT=8000 smashsoda`), then forward UDP 8000 to this PC.
+  To debug networking, `SSB_WINEDEBUG="+winsock,+timestamp" smashsoda` writes Wine's socket trace to `$XDG_RUNTIME_DIR/smashsoda/wine-debug.log`.
+* First join after launch fails with -15000 and `cuCtxCreate failed 2` in the log: the GPU is out of memory (e.g. a local LLM or game is using it). Free some VRAM.
 * "Host does not support hardware video encoding" (-15000) -> NVENC is not reachable: NVIDIA driver, `PROTON_NVIDIA_NVENC`, and the `nvenc:` lines in `smashsoda-wine.log`.
 * "ViGEm not found" in the app -> `ssb-padd` is not running or `/dev/uinput` is not writable.
 * No picture -> a picker should appear when you press Host; `helpers.log` tells why not.
