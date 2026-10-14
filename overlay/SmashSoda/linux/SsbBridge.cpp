@@ -89,9 +89,13 @@ namespace SsbBridge {
 		if (dir.empty() || !text) return;
 
 		// mask a.b.c.d so guest addresses never end up in a file that gets pasted around
+		// (Parsec's own STUN/relay server lines are not guest addresses and are kept: they are what you need to debug connections.
+		// tuning.txt: parsec_log_raw=1 turns the masking off entirely.)
 		std::string out;
 		const size_t n = strlen(text);
+		const bool keep = strncmp(text, "stun", 4) == 0 || tuningInt("parsec_log_raw", 0) != 0;
 		for (size_t i = 0; i < n;) {
+			if (keep) { out.assign(text, n); break; }
 			size_t j = i, dots = 0, digits = 0;
 			while (j < n && (isdigit((unsigned char)text[j]) || (text[j] == '.' && digits > 0))) { if (text[j] == '.') { dots++; digits = 0; } else digits++; j++; }
 			if (dots == 3 && digits > 0) { out += "x.x.x.x"; i = j; }

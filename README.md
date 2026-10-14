@@ -80,6 +80,11 @@ Environment overrides: `SSB_CAPTURE` (auto|gl|shm), `SSB_SOURCE` (monitor|window
 Logs are in `$XDG_RUNTIME_DIR/smashsoda/`: `smashsoda-wine.log` (the app, including `CRASH:` lines with the exception and module+offset if it crashes),
 `helpers.log` (capture/audio/gamepad helpers), `parsec.log` (Parsec's own log, IPs masked).
 
+* Guest sees "peer-to-peer connection failed [-6023 / -11004]" (host log: `-6024`): Parsec could not hole-punch between you and them. Check that
+  `smashsoda-wine.log` shows `parsec: hosting port ...`. This is typical when the guest is on a mobile network or 5G home internet (carrier-grade NAT).
+  Fix it from your side by pinning Parsec's UDP port and forwarding it on your router (the guest then only needs to reach you, no hole punching):
+  `echo 8000 > ~/.local/share/smashsoda-linux/host-port` (or `SSB_HOST_PORT=8000 smashsoda`), then forward UDP 8000 to this PC in the router settings.
+  UPnP is enabled by default, so on many routers this happens automatically; the port Parsec really uses is logged at start.
 * "Host does not support hardware video encoding" (-15000) -> NVENC is not reachable: NVIDIA driver, `PROTON_NVIDIA_NVENC`, and the `nvenc:` lines in `smashsoda-wine.log`.
 * "ViGEm not found" in the app -> `ssb-padd` is not running or `/dev/uinput` is not writable.
 * No picture -> a picker should appear when you press Host; `helpers.log` tells why not.

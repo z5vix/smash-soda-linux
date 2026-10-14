@@ -86,6 +86,9 @@ for _ in $(seq 1 100); do
 	sleep 0.1
 done
 
+# Optional fixed Parsec UDP port (forward it on your router): SSB_HOST_PORT=8000 smashsoda, or put the number in $DATA/host-port
+[[ -z "${SSB_HOST_PORT:-}" && -f "$DATA/host-port" ]] && SSB_HOST_PORT="$(tr -dc '0-9' < "$DATA/host-port")"
+[[ -n "${SSB_HOST_PORT:-}" ]] && export SSB_HOST_PORT
 export PRESSURE_VESSEL_FILESYSTEMS_RW="$BRIDGE${PRESSURE_VESSEL_FILESYSTEMS_RW:+:$PRESSURE_VESSEL_FILESYSTEMS_RW}"
 export SSB_BRIDGE_DIR="$BRIDGE"
 export WINEPREFIX="$PFX" PROTONPATH="$PROTON" GAMEID="${GAMEID:-umu-smashsoda}"
