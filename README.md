@@ -50,6 +50,17 @@ Run (checked at the end of setup, not installed):
   `echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/99-uinput.rules`,
   then add yourself to the `input` group and log in again (and `sudo modprobe uinput`).
 
+## Run it
+
+Open a terminal and type:
+
+```bash
+smashsoda
+```
+
+That's it - it starts the helpers and the app (also available as **Smash Soda** in your application menu). If the command isn't found, make sure
+`~/.local/bin` is in your `PATH`, or run `./smashsoda` from this folder. Stop it by closing the window or pressing Ctrl+C in the terminal.
+
 ## Using it
 Press **Host** in Smash Soda: a screen-share picker (listed as "Smash Soda") opens - choose a screen or window; stopping the room ends the share.
 

@@ -149,7 +149,7 @@ cat > "$HOME/.local/share/applications/smashsoda.desktop" <<DESK
 Type=Application
 Name=Smash Soda
 Comment=Host Parsec rooms (Linux build via Proton)
-Exec=$ROOT/smashsoda
+Exec="$HOME/.local/bin/smashsoda"
 Icon=$APP/icons/icon.ico
 Terminal=false
 Categories=Game;
